@@ -3011,21 +3011,34 @@ async def device_listen(request: Request):
             return JSONResponse({"error": "WAV must be 16-bit mono"}, status_code=400)
         if seconds > DEVICE_MAX_SECONDS:
             return JSONResponse({"error": f"audio: at most {DEVICE_MAX_SECONDS} s per utterance"}, status_code=413)
-        t0 = time.monotonic()
+        return await _device_audio(dev, audio, seconds, direct)
+    return await _device_text(dev, text, direct, None)
+
+
+async def _device_audio(dev: dict, audio: bytes, seconds: float, direct: bool = False, text: str | None = None):
+    """One stretch of speech from a device, as a WAV. text: its transcription when that is already made."""
+    import voice
+    t0 = time.monotonic()
+    if text is None:
         try:
             text = await asyncio.to_thread(voice.transcribe, audio)
         except Exception as exc:
             log.warning("device %s: transcription failed: %s", dev["name"], str(exc)[:160])
             return JSONResponse({"error": "transcription failed"}, status_code=502)
-        heard = {"audio_s": round(seconds, 1), "stt_s": round(time.monotonic() - t0, 2)}
-        import speakers   # voice recognition (speakers.py): "" unless people enrolled their voices
-        if speakers.enrolling(dev["name"]):   # somebody is reading the passage to this device: no agent hears it
-            await asyncio.to_thread(speakers.enroll_heard, audio, seconds, voice.clean_transcript(text or ""))
-            return {"accepted": False, "to": None, "reason": "enrolling", "open": None}
-        who = await asyncio.to_thread(speakers.heard, audio, seconds, dev["name"])
-        if who:
-            heard["speaker"] = who
-            dev = {**dev, "speaker": who}
+    heard = {"audio_s": round(seconds, 1), "stt_s": round(time.monotonic() - t0, 2)}
+    import speakers   # voice recognition (speakers.py): "" unless people enrolled their voices
+    if speakers.enrolling(dev["name"]):   # somebody is reading the passage to this device: no agent hears it
+        await asyncio.to_thread(speakers.enroll_heard, audio, seconds, voice.clean_transcript(text or ""))
+        return {"accepted": False, "to": None, "reason": "enrolling", "open": None}
+    who = await asyncio.to_thread(speakers.heard, audio, seconds, dev["name"])
+    if who:
+        heard["speaker"] = who
+        dev = {**dev, "speaker": who}
+    return await _device_text(dev, text, direct, heard)
+
+
+async def _device_text(dev: dict, text: str, direct: bool, heard: dict | None):
+    import voice
     text = voice.clean_transcript(text or "").strip()
     if not text or _re.fullmatch(r"[\[(].*[\])]", text):  # [BLANK_AUDIO], (noise)
         return {"accepted": False, "to": None, "reason": "empty", "open": None}
@@ -3041,6 +3054,90 @@ async def device_listen(request: Request):
                                       **({"speaker": heard["speaker"]} if heard and heard.get("speaker") else {})})
     log.info("device %s: %s", dev["name"], r["reason"])
     return r
+
+
+@app.websocket("/api/device/stream")
+async def device_stream(websocket: WebSocket):
+    """A device's microphone, live (voice_stream.py): binary messages are 16 kHz 16-bit mono audio as it is
+    heard, any text message says the device is making a sound of its own. Each stretch of speech is
+    answered with what /api/device/listen answers, as text. Closes with 4401 for an unknown key."""
+    import speakers
+    import voice
+    import voice_devices
+    import voice_stream
+    heads = getattr(websocket, "headers", None) or {}
+    if not client_allowed(websocket.client.host if getattr(websocket, "client", None) else "") \
+            or not _host_known(heads.get("host", "127.0.0.1")):
+        await websocket.close(code=1008)
+        return
+    await websocket.accept()
+    dev = voice_devices.authenticate(heads.get("authorization", ""))
+    if not dev:
+        await websocket.close(code=4401, reason="missing or unknown device key")
+        return
+    try:   # ?pause=N: the device's own end-of-speech pause, in tenths of a second
+        seg = voice_stream.Segmenter(int(websocket.query_params.get("pause") or voice_stream.QUIET))
+    except ValueError:
+        seg = voice_stream.Segmenter()
+    sending = asyncio.Lock()
+    tasks: set = set()
+    early = None          # (the speech it is of, its transcription under way): started in the pause after it
+    partial = None        # the transcription of a sentence still being said, for an enrollment
+    partial_at = 0.0
+
+    def text_of(pcm: bytes):
+        return asyncio.create_task(asyncio.to_thread(voice.transcribe, voice_stream.wav(pcm)))
+
+    async def finish(pcm: bytes, early):
+        text = None
+        if early and early[0] == pcm:
+            try:
+                text = await early[1]
+            except Exception:
+                text = None
+        r = await _device_audio(dev, voice_stream.wav(pcm), len(pcm) / 2 / voice_stream.RATE, False, text)
+        if not isinstance(r, dict):
+            r = {"accepted": False, "to": None, "reason": "error", "open": None}
+        async with sending:
+            await websocket.send_text(json.dumps(r))
+
+    async def show(pcm: bytes):
+        text = await asyncio.to_thread(voice.transcribe, voice_stream.wav(pcm))
+        speakers.enroll_heard(b"", 0, text, final=False)
+
+    def keep(task):
+        tasks.add(task)
+        task.add_done_callback(lambda t: (tasks.discard(t), t.cancelled() or t.exception()))
+        return task
+
+    log.info("device %s: microphone stream opened", dev["name"])
+    try:
+        while True:
+            m = await websocket.receive()
+            if m["type"] == "websocket.disconnect":
+                break
+            if m.get("bytes") is None:
+                seg.reset()
+                early = None
+                continue
+            for ev in seg.feed(m["bytes"]):
+                if ev[0] == "soon":
+                    early = (ev[1], keep(text_of(ev[1])))
+                elif ev[0] == "end":
+                    if partial:
+                        partial.cancel()   # its words would arrive after the sentence's own
+                    keep(asyncio.create_task(finish(ev[1], early)))
+                    early = partial = None
+            now = time.monotonic()
+            if seg.active and now - partial_at >= 0.4 and (partial is None or partial.done()) \
+                    and len(seg.so_far()) >= voice_stream.RATE and speakers.enrolling(dev["name"]):
+                partial, partial_at = keep(asyncio.create_task(show(seg.so_far()))), now
+    except (WebSocketDisconnect, RuntimeError):
+        pass
+    finally:
+        for t in list(tasks):
+            t.cancel()
+        log.info("device %s: microphone stream closed", dev["name"])
 
 
 def _passphrase_run(text: str, channel: str, sender: str) -> dict | None:
@@ -3220,6 +3317,14 @@ curl -s -X POST {base}/api/device/played -H "Authorization: Bearer $KEY"
 
 Flow: listen -> (accepted) reply -> audio -> play -> played -> listen ...
 Keep the mic muted while playing, or AgentHub drops what it hears as echo.
+
+## Or: send the microphone live (in place of 1)
+WebSocket {base}/api/device/stream  (ws://, same Authorization header)
+Send binary messages of raw audio as it is heard: 16 kHz, 16-bit little-endian, mono, any size
+(20 ms is good). AgentHub finds where speech starts and ends, so there is no VAD and no pause to
+wait out on the device. ?pause=N sets the pause that ends speech, in tenths of a second (default 6). Each stretch of speech is answered with a text message: the JSON of 1.
+While the device plays a sound of its own, send no audio, and one text message (any) when it
+starts: speech being collected is dropped. Close code 4401: the key is unknown.
 """
 
 

@@ -39,7 +39,7 @@ PASSAGE = ("The weather was fine this morning, so I took a slow walk around the 
            "Later today I plan to fix the back gate and maybe read a few pages of my book.")
 ENROLL_IDLE = 180           # an enrollment nobody speaks to ends after this many seconds
 MIN_SECONDS = 2.0           # shorter speech is too little to learn a voice from
-_enroll: dict | None = None  # the enrollment in progress: {"name", "device", "words", "pos", "stuck", "skipped", "embs", "heard", "at", "done", "error"}
+_enroll: dict | None = None  # the enrollment in progress: {"name", "device", "words", "pos", "ahead" (shown while a sentence is still being said), "stuck", "skipped", "embs", "heard", "at", "done", "error"}
 
 
 def load() -> dict:
@@ -154,7 +154,7 @@ def enroll_start(name: str, device: str) -> str | None:
     if not (model and Path(model).is_file()):
         return "set the model file first"
     with _lock:
-        _enroll = {"name": name, "device": str(device), "words": _said(PASSAGE), "pos": 0, "stuck": False,
+        _enroll = {"name": name, "device": str(device), "words": _said(PASSAGE), "pos": 0, "ahead": 0, "stuck": False,
                    "skipped": [], "embs": [], "heard": "", "at": time.time(), "done": False, "error": ""}
     return None
 
@@ -168,18 +168,23 @@ def enrolling(device: str) -> bool:
         return bool(_enroll and not _enroll["done"] and _enroll["device"] == device)
 
 
-def enroll_heard(wav: bytes, seconds: float, text: str):
-    """The enrolling device heard this. The voice counts when most of it was the passage."""
+def enroll_heard(wav: bytes, seconds: float, text: str, final: bool = True):
+    """The enrolling device heard this. The voice counts when most of it was the passage.
+    final False: the sentence is still being said (a device that streams): the words so far are shown,
+    and nothing is kept until its end."""
     heard = _said(text)
-    e = embed(wav, load()["model"]) if seconds >= MIN_SECONDS and heard else None
+    e = embed(wav, load()["model"]) if final and seconds >= MIN_SECONDS and heard else None
     with _lock:
         s = _enroll
         if not s or s["done"]:
             return
         pos, stuck = _align(heard, s["words"], s["pos"])
+        if not final:
+            s.update(ahead=pos, heard=str(text)[:300], at=time.time())
+            return
         if e is not None and (pos - s["pos"]) * 2 >= len(heard):   # not a voice in the background
             s["embs"].append(e)
-        s.update(pos=pos, stuck=stuck, heard=str(text)[:300], at=time.time())
+        s.update(pos=pos, ahead=pos, stuck=stuck, heard=str(text)[:300], at=time.time())
         _finish(s)
 
 
@@ -189,7 +194,7 @@ def enroll_skip():
         s = _enroll
         if s and not s["done"]:
             s["skipped"].append(s["pos"])
-            s.update(pos=s["pos"] + 1, stuck=False, at=time.time())
+            s.update(pos=s["pos"] + 1, ahead=s["pos"] + 1, stuck=False, at=time.time())
             _finish(s)
 
 
@@ -222,7 +227,8 @@ def enroll_state() -> dict | None:
         s = _enroll
         if not s:
             return None
-        return {"name": s["name"], "device": s["device"], "text": PASSAGE, "pos": s["pos"], "stuck": s["stuck"],
+        return {"name": s["name"], "device": s["device"], "text": PASSAGE, "pos": max(s["pos"], s["ahead"]),
+                "stuck": s["stuck"] and s["ahead"] <= s["pos"],
                 "skipped": list(s["skipped"]), "samples": len(s["embs"]), "heard": s["heard"], "done": s["done"],
                 "error": s["error"]}
 

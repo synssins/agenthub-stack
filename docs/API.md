@@ -186,7 +186,8 @@
 | Method | Path | What it does |
 |---|---|---|
 | GET | `/api/admin/speakers` |  |
-| POST | `/api/admin/speakers` | Body: {enabled?, model?, threshold?} for the settings; {enrol: name} adds the latest voice heard to that person; {forget: name} removes one. |
+| POST | `/api/admin/speakers` | Body: {enabled?, model?, threshold?} for the settings; {enroll: {name, device}} starts a guided enrollment on that device, {enroll: "skip"} passes the word it is stuck on, {enroll: "cancel"} ends it; {forget: name} removes a person. |
+| WebSocket | `/api/device/stream` | A voice device's microphone, live (device key as Bearer): binary messages of 16 kHz 16-bit mono audio; each stretch of speech is answered with the JSON of `/api/device/listen`. `?pause=N`: tenths of a second of pause that end speech. See `/voice-devices.txt`. |
 | GET | `/api/voice/capabilities` | The engine parameters a saved provider advertises (Settings > Voice draws its controls from this). |
 | GET | `/api/voice/check-model` |  |
 | POST | `/api/voice/check-model` | Body: {server, model}: a server from Settings > LLMs and one of its models ("" = its default). |

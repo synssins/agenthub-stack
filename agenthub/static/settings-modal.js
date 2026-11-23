@@ -504,7 +504,7 @@
                 }));
                 heard.textContent = now.heard ? `Heard: ${now.heard}` : 'Nothing heard yet.';
                 skip.disabled = !now.stuck;
-                if (!now.done) { status.textContent = `${now.pos} of ${total} words. Words are marked when a sentence ends.`; return; }
+                if (!now.done) { status.textContent = `${now.pos} of ${total} words.`; return; }
                 status.textContent = now.error || `${now.name} is enrolled from ${now.samples} sentence${now.samples === 1 ? '' : 's'}.`;
                 status.classList.toggle('settings-warn', !!now.error);
                 cancel.replaceWith(btn('Done', end, 'primary sm'));
@@ -514,7 +514,7 @@
             (async function poll() {   // stops when the page is left or the reading is over
                 while (wizard.isConnected && text.isConnected) {
                     try { if (draw((await api('GET', '/api/admin/speakers')).enroll) || !text.isConnected) return; } catch { /* next round */ }
-                    await new Promise(r => setTimeout(r, 700));
+                    await new Promise(r => setTimeout(r, 250));
                 }
             })();
             draw(st);
