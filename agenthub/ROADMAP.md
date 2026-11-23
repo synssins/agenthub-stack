@@ -5,12 +5,12 @@ Owner decisions in order of delivery. Each phase ships live when its tests pass.
 ## 1. UI foundation
 - Theme system: Charcoal (default), Graphite, Midnight (OLED), Light. Accent is fixed per theme. Selected in Settings > Appearance, stored per browser.
 - Settings window regrouped into clear categories (Appearance, Notifications, Chat, Agents, Rulebooks, Integrations, Data).
-- Rulebooks list: descriptions wrap; no horizontal overflow.
+- Rulebooks list: descriptions wrap. No horizontal overflow.
 - Per-agent settings (notification sound, later voice) live on the agent's own configuration page, not in General.
 
 ## 2. Shared artifacts
 - Code blocks of 8+ lines become artifacts stored on the server with version history.
-- Message shows an artifact card; clicking opens a right-side panel over the chat. Copy icon pinned top right, download, click outside or Esc to close.
+- Message shows an artifact card. Clicking opens a right-side panel over the chat. Copy icon pinned top right, download, click outside or Esc to close.
 - Agents in the channel can read and update artifacts (new version, announced in the channel).
 
 ## 3. Control and conversation
@@ -20,29 +20,29 @@ Owner decisions in order of delivery. Each phase ships live when its tests pass.
 
 ## 4. Images
 - ComfyUI image generation through the Nexus comfy_mcp server, registered in Settings > MCP servers and granted per agent.
-- Agent-posted images show as thumbnails; click for a lightbox (full size, previous/next, download, prompt details).
+- Agent-posted images show as thumbnails. Click for a lightbox (full size, previous/next, download, prompt details).
 - Workflow catalog: each workflow tagged by content (NSFW, NSFW-capable, SFW-leaning), model and best use, so agents pick the right one.
 - Masks: paint a mask in the lightbox, or have an agent make one from a description (Florence-2 + SAM2) for inpainting.
 - Per-server MCP tool timeout for long image runs.
 
 ## 4b. Agent memory and fixes
-- Rulebooks on request: agents open one with the rulebook tool only when asked; fine-grained access is an advanced option.
+- Rulebooks on request: agents open one with the rulebook tool only when asked. Fine-grained access is an advanced option.
 - Context compaction for API agents: messages that leave the context window are folded into a rolling summary per agent and channel; long tool loops compact older tool results; `/compact @agent` forces it.
 - Painted masks keep the original pixels under the mask (they turn black today, which hurts partial-denoise inpaints).
-- A stopped API agent drops the cancelled request from its context.
+- A stopped API agent drops the canceled request from its context.
 - Video and audio outputs play inline in chat.
 - Thread composer gets attachments and @-autocomplete.
 - IRC shows artifacts as a title and link, not a bare token.
-- Timed-out ComfyUI jobs are cancelled instead of left running.
+- Timed-out ComfyUI jobs are canceled instead of left running.
 - Agent health panel: model, endpoint up/down, last error and queue per agent.
 
 ## 5. Voice output
-- Pluggable TTS providers (OpenAI-style /v1/audio/speech: Chatterbox :4123 with cloning, Kokoro :8880, external APIs).
+- Pluggable TTS providers (OpenAI-style /v1/audio/speech: Chatterbox:4123 with cloning, Kokoro:8880, external APIs).
 - Voice library with cloning from a short sample. Voice and speed are set on each agent's configuration page.
-- Play button per message, auto-speak toggle per channel, streamed playback; code and artifacts are not read aloud.
+- Play button per message, auto-speak toggle per channel, streamed playback. Code and artifacts are not read aloud.
 
 ## 6. Voice conversation
-- Push-to-talk and voice-activated input (Whisper :10300), with barge-in: speaking interrupts playback and the agent.
+- Push-to-talk and voice-activated input (Whisper:10300), with barge-in: speaking interrupts playback and the agent.
 
 ## 7. Room features
 - Search across channels, artifacts and attachments.

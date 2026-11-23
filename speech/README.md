@@ -6,12 +6,12 @@ Chatterbox Turbo (Resemble AI) with sentence streaming, served as OpenAI `/v1/au
 docker compose up -d --build
 ```
 
-- `voices/`: saved voice presets (`<Name>.pt`). `Jessica` ships as an example.
-- `refs/`: reference recordings (`<Name>.wav`). A preset is made from one the first time the voice is used. Use only recordings you have the right to use; do not clone a real person's voice without their consent.
+- `voices/`: saved voice presets (`<Name>.pt`). `Jessica` is included.
+- `refs/`: reference recordings (`<Name>.wav`). A preset is made from a recording the first time its voice is used.
 - `cache/`: the model, downloaded from Hugging Face on first start.
-- `GET /api/tags` lists the emotion tags the voice performs (`[laugh]`, `[sigh]`, ...); AgentHub reads it.
+- `GET /api/tags` lists the emotion tags the voice performs, such as `[laugh]` and `[sigh]`. AgentHub reads this list.
 - The page at `http://<host>:4125/` has the settings.
 
-There is no login. Keep it on a trusted network.
+The server has no login. Run it on a trusted network.
 
-The image clones `resemble-ai/chatterbox` at a pinned commit and lays the files of `src/` over it; see the `Dockerfile`.
+The image clones `resemble-ai/chatterbox` at a pinned commit and lays the files of `src/` over it. See the `Dockerfile`.

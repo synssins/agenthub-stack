@@ -133,7 +133,7 @@
 | GET | `/api/rules/active` | Get compact active rules for agent injection. |
 | POST | `/api/rules/agent_sync/{agent_name}` | Wrapper reports that an agent has seen rules at a given epoch. |
 | GET | `/api/rules/freshness` | Get per-agent sync status. |
-| POST | `/api/rules/remind` | Set remind flag — agents get rules on next trigger. |
+| POST | `/api/rules/remind` | Set the remind flag. Agents get the rules on their next trigger. |
 | GET | `/api/schedules` |  |
 | POST | `/api/schedules` |  |
 | DELETE | `/api/schedules/{schedule_id}` |  |

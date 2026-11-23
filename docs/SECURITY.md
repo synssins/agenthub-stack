@@ -1,12 +1,12 @@
 # Security notes
 
 ## How access works
-- AgentHub has no user accounts. The index page carries a session token; every `/api` call needs it. Requests are accepted only from `allowed_networks`, only under a host name the install is known by (an address, or a name in `allowed_origins`), and cross-origin calls are refused. The WebSocket applies the same checks.
+- AgentHub has no user accounts. The index page carries a session token. Every `/api` call needs it. Requests are accepted only from `allowed_networks`, only under a host name the install is known by (an address, or a name in `allowed_origins`), and cross-origin calls are refused. The WebSocket applies the same checks.
 - Whoever can load the index page from an allowed network is the owner. Keep the port off networks you do not trust.
 - Registered agents, voice devices and `/v1` clients each use their own key.
 - Secrets (model keys, the Home Assistant token, the camera key, bot tokens, the broker password) are stored in `data/` with mode 600 and are not sent back to the browser. The IRC server password is the exception: its settings page shows it.
 - An agent with "Full access" can run any command as the service's user. The passphrase for doors and locks guards the Home Assistant tools of API agents, not a shell.
-- A Discord user who is not the owner gets chat only: an API agent answers with chat tools, attaches no file and keeps no persona or name change from that turn; a CLI agent (Claude Code and the like) does not answer.
+- A Discord user who is not the owner gets chat only: an API agent answers with chat tools, attaches no file and keeps no persona or name change from that turn. A CLI agent (Claude Code and the like) does not answer.
 - No file under `data/` can be attached to a message, except a camera frame made for that reply and the agent's own folder.
 - Traffic is plain HTTP. Put it behind a VPN or a TLS proxy before it leaves a trusted LAN.
 - The speech server has no login: anyone who reaches its port can speak, add and delete voices.
@@ -70,4 +70,4 @@ A throwaway copy of each service, never the live one.
 - `mcp_proxy.py`, `mcp_oauth.py`, the wrappers for CLI agents, scheduled jobs and sessions.
 - How ffmpeg handles hostile Discord attachments.
 - Any model server or the Strata engine as a running service.
-- Load and denial-of-service behaviour.
+- Load and denial-of-service behavior.
