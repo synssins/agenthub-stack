@@ -1,0 +1,55 @@
+From 80f920013612a7bbbeb5df28086fee3193f7458f Mon Sep 17 00:00:00 2001
+From: AgentHub stack <noreply@example.invalid>
+Date: Mon, 19 Oct 2026 20:04:38 +0000
+Subject: [PATCH 16/17] four-gpu: prompt GEMMs on CUDA via
+ ext_codeplay_enqueue_native_command (no host_task + stream sync per GEMM)
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ sycl/include/strata/prefill/gemm_ex.hpp | 10 ++++++----
+ 1 file changed, 6 insertions(+), 4 deletions(-)
+
+diff --git a/sycl/include/strata/prefill/gemm_ex.hpp b/sycl/include/strata/prefill/gemm_ex.hpp
+index cd91e9e..19ff586 100644
+--- a/sycl/include/strata/prefill/gemm_ex.hpp
++++ b/sycl/include/strata/prefill/gemm_ex.hpp
+@@ -1,6 +1,6 @@
+ // four-gpu: the prompt path's GEMMs on any card.  dpct::blas::gemm is oneMKL, which runs on Intel GPUs only; on a
+ // CUDA queue (an NVIDIA card in a four-gpu build, STRATA_CUBLAS_INTEROP) the same call goes to cublasGemmEx on the
+-// queue's own CUDA stream through a SYCL host_task.  Same arguments as dpct::blas::gemm, same column-major meaning.
++// queue's own CUDA stream (ext_codeplay_enqueue_native_command).  Same arguments as dpct::blas::gemm, same column-major meaning.
+ #pragma once
+ #include <sycl/sycl.hpp>
+ #include <dpct/dpct.hpp>
+@@ -28,7 +28,7 @@ inline cudaDataType cuda_type(dpct::library_data_t t) {
+ inline cublasOperation_t cuda_op(oneapi::mkl::transpose t) {
+     return t == oneapi::mkl::transpose::nontrans ? CUBLAS_OP_N : CUBLAS_OP_T;
+ }
+-// one cuBLAS handle per CUDA context (each card's), made on first use inside that card's host_task
++// one cuBLAS handle per CUDA context (each card's), made on first use inside that card's native command
+ inline cublasHandle_t cublas_for(CUcontext ctx) {
+     static std::mutex m;
+     static std::map<CUcontext, cublasHandle_t> handles;
+@@ -56,7 +56,10 @@ inline int gemm_ex(dpct::blas::descriptor_ptr handle, oneapi::mkl::transpose ta,
+     if (q.get_backend() == sycl::backend::ext_oneapi_cuda) {
+         const float al = *alpha, be = *beta;
+         q.submit([&](sycl::handler& h) {
+-             h.host_task([=](sycl::interop_handle ih) {
++             // the cuBLAS call goes onto the queue's own CUDA stream, ordered and tracked by the runtime: no host
++             // round trip or stream sync per GEMM (a host_task + cuStreamSynchronize per expert GEMM held the prompt
++             // path to the host: 92% of a T4 stage's time, "host staging" 47 of 48 s for a 4096-token chunk)
++             h.ext_codeplay_enqueue_native_command([=](sycl::interop_handle ih) {
+                  CUstream s = ih.get_native_queue<sycl::backend::ext_oneapi_cuda>();
+                  CUcontext ctx = nullptr;
+                  cuCtxGetCurrent(&ctx);
+@@ -69,7 +72,6 @@ inline int gemm_ex(dpct::blas::descriptor_ptr handle, oneapi::mkl::transpose ta,
+                      CUBLAS_GEMM_DEFAULT);
+                  if (st != CUBLAS_STATUS_SUCCESS)
+                      std::fprintf(stderr, "strata: cublasGemmEx failed (%d), m %d n %d k %d\n", (int) st, m, n, k);
+-                 cuStreamSynchronize(s);   // a host_task ends when this returns: the stream's work must be done
+              });
+          });
+         return 0;
+-- 
+2.53.0
+

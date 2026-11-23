@@ -1,0 +1,184 @@
+From e0053a16f9860aaa2e495d83353175eabb276f99 Mon Sep 17 00:00:00 2001
+From: AgentHub stack <noreply@example.invalid>
+Date: Mon, 19 Oct 2026 15:05:16 +0000
+Subject: [PATCH 01/17] four-gpu: build the SYCL engine for NVIDIA (sm_75)
+ alongside Intel
+
+- dpct SHFL_SYNC: sycl::bit_cast for the NVVM bitcast builtins
+- XMX kernels: joint_matrix via a no-op stand-in in the NVPTX pass
+- Turing: two m16n8k8 MMAs; no cp.async (STRATA_NVPTX_TURING)
+- fused_gr fallback copy: sycl::float4
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ sycl/include/dpct/util.hpp                    |  4 ++--
+ sycl/include/strata/jm_portable.hpp           | 22 +++++++++++++++++++
+ sycl/src/kernels/cuda/fused_gr.dp.cpp         |  4 ++--
+ sycl/src/kernels/cuda/iq_kernels.dp.cpp       |  5 +++--
+ sycl/src/kernels/cuda/qsa_prompt_attn.dp.cpp  | 10 ++++++++-
+ .../kernels/cuda/qsa_prompt_attn_xmx.dp.cpp   |  3 ++-
+ sycl/src/prefill/xmx_moe.dp.cpp               |  3 ++-
+ 7 files changed, 42 insertions(+), 9 deletions(-)
+ create mode 100644 sycl/include/strata/jm_portable.hpp
+
+diff --git a/sycl/include/dpct/util.hpp b/sycl/include/dpct/util.hpp
+index 033f6c7..125b8be 100644
+--- a/sycl/include/dpct/util.hpp
++++ b/sycl/include/dpct/util.hpp
+@@ -443,8 +443,8 @@ namespace experimental {
+     asm("mov.b16 %0,%1;" : "=h"(RES) : "h"(static_cast<short>(tmp_b32)));      \
+   } else if constexpr (std::is_same_v<T, float>) {                             \
+     auto tmp_b32 = __nvvm_shfl_sync_##SHUFFLE_INSTR(                           \
+-        MASK, __nvvm_bitcast_f2i(VAL), SHFL_PARAM, C);                         \
+-    RES = __nvvm_bitcast_i2f(tmp_b32);                                         \
++        MASK, sycl::bit_cast<int>(VAL), SHFL_PARAM, C);                         \
++    RES = sycl::bit_cast<float>(tmp_b32);                                         \
+   } else {                                                                     \
+     RES = __nvvm_shfl_sync_##SHUFFLE_INSTR(MASK, VAL, SHFL_PARAM, C);          \
+   }
+diff --git a/sycl/include/strata/jm_portable.hpp b/sycl/include/strata/jm_portable.hpp
+new file mode 100644
+index 0000000..594a420
+--- /dev/null
++++ b/sycl/include/strata/jm_portable.hpp
+@@ -0,0 +1,22 @@
++// four-gpu: the XMX kernels' joint_matrix namespace.  On every target but NVIDIA it is SYCL's own; in the NVPTX device
++// pass it is a no-op stand-in, because Intel's XMX tile shapes (8x16x16, ext_intel_packed) have no NVIDIA form.  The
++// kernel bodies and their captures stay identical on both passes; the XMX paths are never launched on a CUDA device.
++#pragma once
++#include <sycl/sycl.hpp>
++
++#if defined(__SYCL_DEVICE_ONLY__) && defined(__NVPTX__)
++namespace strata::jm_stub {
++using sycl::ext::oneapi::experimental::matrix::use;
++using sycl::ext::oneapi::experimental::matrix::layout;
++template <typename Group, typename T, use U, size_t Rows, size_t Cols, layout L = layout::dynamic>
++struct joint_matrix { T unused; };
++template <typename Group, typename M, typename T> inline void joint_matrix_fill(Group, M&, const T&) {}
++template <typename Group, typename M, typename... A> inline void joint_matrix_load(Group, M&, A...) {}
++template <typename Group, typename M, typename... A> inline void joint_matrix_store(Group, const M&, A...) {}
++template <typename Group, typename D, typename A, typename B, typename C>
++inline void joint_matrix_mad(Group, D&, const A&, const B&, const C&) {}
++}  // namespace strata::jm_stub
++namespace strata_jm = strata::jm_stub;
++#else
++namespace strata_jm = sycl::ext::oneapi::experimental::matrix;
++#endif
+diff --git a/sycl/src/kernels/cuda/fused_gr.dp.cpp b/sycl/src/kernels/cuda/fused_gr.dp.cpp
+index bf7e873..4862b8f 100644
+--- a/sycl/src/kernels/cuda/fused_gr.dp.cpp
++++ b/sycl/src/kernels/cuda/fused_gr.dp.cpp
+@@ -1235,7 +1235,7 @@ auto &part = *sycl::ext::oneapi::group_local_memory_for_overwrite<float[WARPS]>(
+ }
+ 
+ #if defined(DPCT_COMPATIBILITY_TEMP) && DPCT_COMPATIBILITY_TEMP >= 800 &&      \
+-    !defined(__HIPCC__)
++    !defined(__HIPCC__) && !defined(STRATA_NVPTX_TURING)   // four-gpu: no cp.async on sm_75
+ #define STRATA_GR_CP_ASYNC 1
+ #endif
+ __dpct_inline__ void cp_async16(void *smem, const void *gmem) {
+@@ -1258,7 +1258,7 @@ __dpct_inline__ void cp_async16(void *smem, const void *gmem) {
+             *(((uint32_t *)(uintptr_t)gmem) + 3);
+ #endif
+ #else
+-    *reinterpret_cast<float4*>(smem) = *reinterpret_cast<const float4*>(gmem);
++    *reinterpret_cast<sycl::float4*>(smem) = *reinterpret_cast<const sycl::float4*>(gmem);   // four-gpu: sycl::float4
+ #endif
+ }
+ __dpct_inline__ void cp_async_commit() {
+diff --git a/sycl/src/kernels/cuda/iq_kernels.dp.cpp b/sycl/src/kernels/cuda/iq_kernels.dp.cpp
+index 1f8b3c7..57a39db 100644
+--- a/sycl/src/kernels/cuda/iq_kernels.dp.cpp
++++ b/sycl/src/kernels/cuda/iq_kernels.dp.cpp
+@@ -6,6 +6,7 @@
+ // included unchanged.
+ #define DPCT_PROFILING_ENABLED
+ #include <sycl/sycl.hpp>
++#include "strata/jm_portable.hpp"
+ #include <dpct/dpct.hpp>
+ #include "strata/sycl_math.hpp"
+ #include "strata/sycl_queue.hpp"
+@@ -5563,7 +5564,7 @@ constexpr int kSgW = 16;
+ #else
+ constexpr int kSgW = 8;
+ #endif
+-namespace jm = sycl::ext::oneapi::experimental::matrix;
++namespace jm = strata_jm;   // four-gpu: SYCL's matrix API, a no-op stand-in in the NVPTX pass
+ struct Grp {
+     const uint8_t* a[kXmxGroupMax];
+     const uint8_t* b[kXmxGroupMax];
+@@ -5730,7 +5731,7 @@ void iq_xmx_grouped(int ty, const uint8_t* const* a, const uint8_t* const* b, co
+ // swiglu_interleaved expects). K must be a multiple of 256 (a QK_K block per slab) or the whole row must fit a slab
+ // (K = 640: 16 rows are 40 blocks, block-aligned since 16 * 640 / 256 = 40).
+ namespace xmx {
+-namespace jm = sycl::ext::oneapi::experimental::matrix;
++namespace jm = strata_jm;   // four-gpu: SYCL's matrix API, a no-op stand-in in the NVPTX pass
+ constexpr int SG = 16;                 // XMX sub-group size
+ constexpr int NSG = 8;                 // sub-groups per work-group
+ constexpr int WG = SG * NSG;
+diff --git a/sycl/src/kernels/cuda/qsa_prompt_attn.dp.cpp b/sycl/src/kernels/cuda/qsa_prompt_attn.dp.cpp
+index e459919..bbbdfe8 100644
+--- a/sycl/src/kernels/cuda/qsa_prompt_attn.dp.cpp
++++ b/sycl/src/kernels/cuda/qsa_prompt_attn.dp.cpp
+@@ -62,7 +62,15 @@ __dpct_inline__ void mma16816(float *c, const uint32_t *a, const uint32_t *b) {
+                  : "+f"(c[0]), "+f"(c[1]), "+f"(c[2]), "+f"(c[3])
+                  : "r"(a[2]), "r"(a[3]), "r"(b[1]));
+ #else
+-#if defined(__SYCL_DEVICE_ONLY__) && defined(__NVPTX__)
++#if defined(__SYCL_DEVICE_ONLY__) && defined(__NVPTX__) && defined(STRATA_NVPTX_TURING)
++    // four-gpu: Turing has no m16n8k16 f16; two m16n8k8 steps on the same fragments (the CUDA engine's sm_75 form)
++    asm volatile("mma.sync.aligned.m16n8k8.row.col.f32.f16.f16.f32 {%0,%1,%2,%3}, {%4,%5}, {%6}, {%0,%1,%2,%3};\n"
++                 : "+f"(c[0]), "+f"(c[1]), "+f"(c[2]), "+f"(c[3])
++                 : "r"(a[0]), "r"(a[1]), "r"(b[0]));
++    asm volatile("mma.sync.aligned.m16n8k8.row.col.f32.f16.f16.f32 {%0,%1,%2,%3}, {%4,%5}, {%6}, {%0,%1,%2,%3};\n"
++                 : "+f"(c[0]), "+f"(c[1]), "+f"(c[2]), "+f"(c[3])
++                 : "r"(a[2]), "r"(a[3]), "r"(b[1]));
++#elif defined(__SYCL_DEVICE_ONLY__) && defined(__NVPTX__)
+     asm volatile("mma.sync.aligned.m16n8k16.row.col.f32.f16.f16.f32 "
+                  "{%0,%1,%2,%3}, {%4,%5,%6,%7}, {%8,%9}, "
+                  "{%0,%1,%2,%3};\n"
+diff --git a/sycl/src/kernels/cuda/qsa_prompt_attn_xmx.dp.cpp b/sycl/src/kernels/cuda/qsa_prompt_attn_xmx.dp.cpp
+index 1aa9d2d..852125e 100644
+--- a/sycl/src/kernels/cuda/qsa_prompt_attn_xmx.dp.cpp
++++ b/sycl/src/kernels/cuda/qsa_prompt_attn_xmx.dp.cpp
+@@ -19,6 +19,7 @@
+ #include "strata/kernels/kv_q8.hpp"
+ #include "strata/sycl_queue.hpp"
+ #include <sycl/sycl.hpp>
++#include "strata/jm_portable.hpp"
+ #include <sycl/ext/oneapi/matrix/matrix.hpp>
+ #include <dpct/dpct.hpp>
+ #include <cmath>
+@@ -28,7 +29,7 @@
+ 
+ namespace strata::kernels {
+ namespace {
+-namespace jm = sycl::ext::oneapi::experimental::matrix;
++namespace jm = strata_jm;   // four-gpu: SYCL's matrix API, a no-op stand-in in the NVPTX pass
+ constexpr int HD = 256, G = 12, SG = 16, NSG = 8, THREADS = SG * NSG, QS = HD + 8;
+ static_assert(HD == strata::core::kCompiledGeometry.head_dim && G == strata::core::kCompiledGeometry.n_head / strata::core::kCompiledGeometry.n_head_kv,
+               "qsa_prompt_attn_xmx is compiled for core/geometry.hpp");
+diff --git a/sycl/src/prefill/xmx_moe.dp.cpp b/sycl/src/prefill/xmx_moe.dp.cpp
+index b25a058..335bfaa 100644
+--- a/sycl/src/prefill/xmx_moe.dp.cpp
++++ b/sycl/src/prefill/xmx_moe.dp.cpp
+@@ -4,6 +4,7 @@
+ // Measured standalone on the A770 (64 experts, gamma-distributed rows, vs per-expert oneMKL): down 6.1x at mean 40
+ // rows, 2.8x at 160, 1.75x at 320; gate/up 3.0x / 1.46x / 0.79x (oneMKL wins above ~250 rows: the caller picks).
+ #include <sycl/sycl.hpp>
++#include "strata/jm_portable.hpp"
+ #include <sycl/ext/oneapi/matrix/matrix.hpp>
+ #include <sycl/ext/intel/experimental/grf_size_properties.hpp>
+ #include <cstdlib>
+@@ -14,7 +15,7 @@
+ namespace strata::prefill::xmx {
+ namespace {
+ using half = sycl::half;
+-namespace jm = sycl::ext::oneapi::experimental::matrix;
++namespace jm = strata_jm;   // four-gpu: SYCL's matrix API, a no-op stand-in in the NVPTX pass
+ // Sub-group width = the XMX tile's N: 8 on Alchemist (DG2, joint_matrix 8x8x16), 16 on Xe2 (Battlemage, 8x16x16; the
+ // CMake switch STRATA_XMX_SG16 for an AOT bmg / lnl build).  A build has one shape: the other is not valid there.
+ #ifdef STRATA_XMX_SG16
+-- 
+2.53.0
+

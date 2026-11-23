@@ -1,0 +1,241 @@
+From fd48f7b361bb7346f9168db87b7762b14c7ad93e Mon Sep 17 00:00:00 2001
+From: AgentHub stack <noreply@example.invalid>
+Date: Mon, 19 Oct 2026 19:12:24 +0000
+Subject: [PATCH 11/17] four-gpu: launcher, runtime image, staging script and
+ docs/FOUR_GPU.md
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ docs/FOUR_GPU.md                 | 115 +++++++++++++++++++++++++++++++
+ sycl/serve/strata-sycl-4gpu.sh   |  54 +++++++++++++++
+ sycl/tools/Dockerfile.4gpu       |  11 +++
+ sycl/tools/stage_4gpu_runtime.sh |  16 +++++
+ 4 files changed, 196 insertions(+)
+ create mode 100644 docs/FOUR_GPU.md
+ create mode 100755 sycl/serve/strata-sycl-4gpu.sh
+ create mode 100644 sycl/tools/Dockerfile.4gpu
+ create mode 100755 sycl/tools/stage_4gpu_runtime.sh
+
+diff --git a/docs/FOUR_GPU.md b/docs/FOUR_GPU.md
+new file mode 100644
+index 0000000..8b4cc35
+--- /dev/null
++++ b/docs/FOUR_GPU.md
+@@ -0,0 +1,115 @@
++# Four GPUs, two vendors: one engine on Intel Arc and NVIDIA together (experimental)
++
++The SYCL port (`sycl/`) built for Intel **and** NVIDIA in one binary, so a single engine runs one model with its layer
++split across Intel Arc and NVIDIA cards. Measured on 2x Arc Pro B60 (24 GB) + 2x Tesla T4 (16 GB), Qwen3.8-Flash-Next
++IQ3_S, branch `four-gpu` on top of 477ac13 (after v0.1.45).
++
++| | 2x B60 (stock SYCL engine) | 2x B60 (four-gpu binary, same runtime) | **B60 + T4 + T4 + B60 (one engine)** |
++|---|---:|---:|---:|
++| experts in VRAM | 17.2k of 24.6k (~99.0% routed) | 16.0k (~98.8%) | **23.2k (~99.8%)** |
++| decode, 300-token chats (median of 3) | 30-37 tok/s | 30.8 | **21.1** (21-27) |
++| prompt, 3K tokens | 554-653 | 552 | **113** |
++| images | yes (CPU encoder) | yes | yes |
++
++**Today the four-card engine is slower than the two B60s alone.** It holds more of the model in VRAM, but the T4
++stages run the Intel-tuned kernels through SYCL instead of Strata's CUDA engine, every NVIDIA kernel is capped at 64
++registers, and each Intel/NVIDIA boundary is a host copy. See "Not done" for what would close the gap.
++
++## What had to change, and why
++
++### 1. The engine compiles for NVIDIA (`sycl/`, commits e0053a1, 60e0b3f)
++
++| Change | Why |
++|---|---|
++| `dpct/util.hpp`: `SHFL_SYNC` uses `sycl::bit_cast` | `__nvvm_bitcast_f2i/i2f` are not declared by icpx 2026.1; the NVPTX branch of every dpct sub-group shuffle failed (≈180 of the first 202 errors) |
++| `strata/jm_portable.hpp` (new), `namespace jm = strata_jm` in `iq_kernels`, `qsa_prompt_attn_xmx`, `xmx_moe` | the XMX kernels use Intel tile shapes (8x16x16, `ext_intel_packed`) with no NVIDIA form. In the NVPTX device pass `jm` is a no-op stand-in; kernel bodies and captures stay identical, so SYCL's host/device lambda layout check passes (compiling the bodies out does not). XMX paths are never launched on CUDA |
++| `qsa_prompt_attn.dp.cpp`: two `mma.m16n8k8` under `STRATA_NVPTX_TURING` | `m16n8k16` f16 needs sm_80; Turing runs the same fragments as two k=8 steps (the CUDA engine's sm_75 form) |
++| `fused_gr.dp.cpp`: no `cp.async` under `STRATA_NVPTX_TURING`; fallback copy uses `sycl::float4` | `cp.async` needs sm_80; the old fallback still said CUDA's `float4` |
++| `CMakeLists.txt`: `STRATA_SYCL_NVPTX=sm_75`, `STRATA_SYCL_CUDA_PATH` | adds `nvptx64-nvidia-cuda` beside the `spir64_gen` AOT target, so the Intel side keeps its AOT build (`bmg-g21`, `STRATA_XMX_SG16`). An earlier JIT (`spir64`) build answered "!!!!" on the B60s: the JIT path's flags were bypassed |
++
++### 2. It runs on NVIDIA
++
++| Change | Why |
++|---|---|
++| `STRATA_SYCL_NVPTX_MAXRREG` (default 64), passed as top-level `-Xcuda-ptxas --maxrregcount` (0191313, 589b971) | many kernels launch 1024-item work-groups and dpct dropped CUDA's `__launch_bounds__`; one used 232 registers x 1024 > 65536 (`UR_RESULT_ERROR_OUT_OF_RESOURCES`). Through `-Xsycl-target-backend` the option does not reach ptxas |
++| `use_root_sync` removed from all 394 launches, 49 files (5b09089) | dpct added it as boilerplate; no kernel syncs the grid. On CUDA it makes every launch cooperative, which fails past one wave (`CUDA_ERROR_COOPERATIVE_LAUNCH_TOO_LARGE`) |
++| `strata/prefill/gemm_ex.hpp` (new), the 3 prompt GEMMs in `gemm.dp.cpp` call it (ef33cc9, e7dfce2) | `dpct::blas::gemm` is oneMKL, Intel GPUs only (a 3K prompt segfaulted). On a CUDA queue `gemm_ex` calls `cublasGemmEx` on the queue's stream from a `host_task` (then `cuStreamSynchronize`); elsewhere unchanged. Links cuBLAS and the driver stub when `STRATA_SYCL_NVPTX` is set |
++
++### 3. The layer split crosses vendors
++
++| Change | Why |
++|---|---|
++| `Verifier::set_hand_peer` / `hand_sync`; `generate.cpp` allocates each hand-off through its writing stage's card, and a second buffer through the reading stage's card when the backends differ (4b6d049) | a stage hands the next one its residual through mapped host memory that the next stage's kernels read directly. An Intel card (xe) can only address Level Zero host allocations, an NVIDIA card only CUDA ones, and `cuMemHostRegister` refuses Level Zero memory (`CUDA_ERROR_INVALID_VALUE`). The host now copies the hand-off (≈52 KB per token row) between the two before the next stage runs; same-vendor boundaries keep one shared buffer |
++| `strata::malloc_host` / `make_host_visible` (`strata/host_visible.hpp`, 36 call sites; 82b76e0, ec8b87f) | first attempt at the same problem: registers host allocations with CUDA as portable memory. **It fails for every Level Zero allocation** (215 `cuMemHostRegister` failures logged per start) and the split works without it; kept only because it was in the tested build. Candidate to revert (and retest) |
++
++### 4. Outside the engine (`sycl/serve`, `sycl/tools`)
++
++| File | What |
++|---|---|
++| `sycl/serve/strata-sycl-4gpu.sh` | the `exe` for the config: `strata-sycl.sh` plus `--gpus all`, the open-source DPC++ runtime and oneMKL/cuBLAS libs mounted and on `LD_LIBRARY_PATH`, host `/dev/shm` shared (image embeddings), optional `--cpuset-cpus` |
++| `sycl/tools/Dockerfile.4gpu` | runtime image: `nvidia/cuda:12.9.1-devel-ubuntu24.04` + Level Zero GPU runtime (kobuk-team PPA) |
++| `sycl/tools/stage_4gpu_runtime.sh` | fetches intel/llvm `v7.2.0` `sycl_linux.tar.gz`; copies oneMKL SYCL + compiler math libs out of `strata-sycl-dev` |
++
++Why a separate runtime: Intel's oneAPI 2026.1 runtime loads the open-source CUDA adapter but calls
++`urMemoryExportExportMemoryHandleExp`, which it does not implement, so the engine (built by icpx 2026.1) runs on the
++open-source DPC++ 7.2.0 runtime (same Unified Runtime 0.12) with Intel's oneMKL beside it. That runtime's `libumf`
++does not load on glibc 2.43, hence Ubuntu 24.04. Codeplay's oneAPI-for-NVIDIA plugin was not used: every download
++endpoint and their APT repository answered 404 (2026-10-19).
++
++## Build
++
++In `strata-sycl-dev` (unchanged), with a CUDA toolkit mounted at `/usr/local/cuda`:
++
++    docker run --rm -u $(id -u):$(id -g) -v "$PWD/..:/work" -v /path/to/cuda:/usr/local/cuda strata-sycl-dev "
++      cmake -S /work/Strata/sycl -B /work/Strata/build-sycl-4gpu -G Ninja -DCMAKE_C_COMPILER=icx -DCMAKE_CXX_COMPILER=icpx \
++        -DSTRATA_SYCL_AOT=bmg-g21 -DSTRATA_SYCL_NVPTX=sm_75 -DSTRATA_SYCL_CUDA_PATH=/usr/local/cuda &&
++      REPO=/work/Strata BUILD_DIR=/work/Strata/build-sycl-4gpu bash /work/Strata/sycl/tools/build.sh strata"
++
++`bmg-g31` for a B70. The CUDA toolkit's major version decides the runtime cuBLAS (`libcublas.so.13` for 13.x).
++Host gotcha met here: CUDA 13.1 with glibc 2.43 fails on `rsqrt`/`rsqrtf` exception specifiers in
++`crt/math_functions.h` (lines 629/653: add `noexcept (true)`) - patch a private copy, not the system toolkit.
++
++## Run
++
++    sycl/tools/stage_4gpu_runtime.sh /opt/strata-4gpu
++    docker build -t strata-sycl-4gpu -f sycl/tools/Dockerfile.4gpu sycl/tools
++
++In the run config (`strata-<model>.json`, made by `./setup.sh --backend sycl` for the Intel cards, then edited):
++
++    "exe": "/path/to/Strata/sycl/serve/strata-sycl-4gpu.sh",
++    "gpu": [0, 1, 2, 3],
++    "layer_split": "auto",
++    "env": {
++      "ONEAPI_DEVICE_SELECTOR": "level_zero:*;cuda:*",
++      "STRATA_SYCL_BIN": "build-sycl-4gpu/strata",
++      "STRATA_DPCPP_DIR": "/opt/strata-4gpu/dpcpp",
++      "STRATA_ONEAPI_RT": "/opt/strata-4gpu/oneapi-rt",
++      "STRATA_CUDA_LIB": "/path/to/cuda/lib64",
++      "STRATA_MIRROR_MIB": "0",
++      "STRATA_VERIFY_NO_HOST": "0",
++      "STRATA_STAGE_TRIM": "1"
++    }
++
++`STRATA_MIRROR_MIB=0` is needed on B60 splits (otherwise exit 139 at the first answer); `STRATA_VERIFY_NO_HOST=0`
++lets the CPU compute the few experts no card holds. Images: the config's `vision` block (CPU encoder) and `--vision`
++in `args` - the SYCL engine has the image path; `setup_intel.py` writes `--vision none`, so add them by hand. The
++image embeddings go through `/dev/shm`, which the launcher shares; set `TMPDIR` to a directory the container sees
++at the same path. Start with `sycl/serve/server_intel.py --engine strata --config <it> --port N`.
++
++The auto split ordered the cards B60, T4, T4, B60 (layers 0-10, 11-21, 22-31, 32-47 + head): two vendor
++boundaries, each a host copy.
++
++## Not done / known issues
++
++- **Speed.** Per-kernel `__launch_bounds__` equivalents instead of the global 64-register cap; an async cuBLAS call
++  (`ext_codeplay_enqueue_native_command`) instead of `host_task` + stream sync; a card order with one vendor
++  boundary instead of two (T4, T4, B60, B60); tensor-core prompt kernels for NVIDIA in place of the stubbed XMX ones.
++  The prompt path (113 tok/s) is where the T4 stages hurt most.
++- `--pipeline-windows` (its second hand-off, `hand_b`) and `--parallel` / `--batch` slots on a mixed split: not run.
++- Mixed toolchain: built by icpx 2026.1, run on open-source DPC++ 7.2.0 with Intel's oneMKL - works, but is an ABI
++  combination nobody supports. A cleaner route is building with open-source DPC++ and oneMath (cuBLAS + oneMKL
++  backends).
++- `strata::malloc_host`'s CUDA registration fails for Level Zero memory (see above): revert candidate.
++- `setup_intel.py` knows only the Intel cards; the four-card config is edited by hand.
++- sm_75 only was built and run. Other NVIDIA generations should work without `STRATA_NVPTX_TURING` (sm_80+ keeps the
++  `m16n8k16` and `cp.async` paths) but are untested.
+diff --git a/sycl/serve/strata-sycl-4gpu.sh b/sycl/serve/strata-sycl-4gpu.sh
+new file mode 100755
+index 0000000..d59eaf2
+--- /dev/null
++++ b/sycl/serve/strata-sycl-4gpu.sh
+@@ -0,0 +1,54 @@
++#!/usr/bin/env bash
++# strata-sycl-4gpu.sh: strata-sycl.sh for a four-gpu build (STRATA_SYCL_NVPTX): Intel and NVIDIA cards in one engine.
++# Differences: the NVIDIA cards are passed in (--gpus all), the engine runs on the open-source DPC++ runtime (its CUDA
++# and Level Zero adapters; Intel's closed runtime cannot load the CUDA adapter), host /dev/shm is shared (the image
++# encoder's embeddings), and STRATA_SYCL_CPUSET pins the container's CPUs.  docs/FOUR_GPU.md.
++#
++# (from strata-sycl.sh:) the SYCL-built engine as a drop-in `exe` for serve/server.py (--engine strata). The port's binary
++# needs the oneAPI runtime of the dev image, so this runs it there with stdin/stdout attached (the serve protocol is
++# lines on those pipes) and stderr going to the server's log. Paths in the config's args are the container's:
++# the data root is mounted at /work.
++#   STRATA_SYCL_ROOT   host directory mounted at /work        (default: two levels above this script's repo)
++#   STRATA_SYCL_IMAGE  the runtime image                      (default: strata-sycl-dev)
++#   STRATA_SYCL_BIN    the engine binary, relative to the repo (default: build-sycl-aot/strata)
++#   STRATA_SYCL_NAME   the container's name                   (default: strata-sycl-serve)
++#   STRATA_DPCPP_DIR   host dir of the open-source DPC++ release (intel/llvm sycl_linux.tar.gz)   (required)
++#   STRATA_ONEAPI_RT   host dir with oneMKL's SYCL libs and libsvml/libimf/libirng/libintlc         (required)
++#   STRATA_CUDA_LIB    host dir with libcublas of the toolkit the engine was built with             (required)
++#   STRATA_SYCL_CPUSET the container's CPUs, e.g. 1,3,5 (optional)
++# Passed into the container: every variable of this script's environment that starts with STRATA_ (the config's
++# "env" block arrives that way: the server puts it in the engine's environment), ONEAPI_ (level_zero:* for a
++# two-card split, #423), UR_, IGC_, SYCL_ or ZES_. The port's own defaults (below) are overridden the same way,
++# e.g. "env": {"STRATA_VERIFY_NO_HOST": "0"} in the config.
++set -euo pipefail
++here=$(cd "$(dirname "$0")/../.." && pwd)                 # the repo
++root=${STRATA_SYCL_ROOT:-$(dirname "$here")}
++repo_in=/work/$(basename "$here")
++name=${STRATA_SYCL_NAME:-strata-sycl-serve}
++docker rm -f "$name" >/dev/null 2>&1 || true              # a container left behind by a killed server
++args=""
++for a in "$@"; do args+=" $(printf '%q' "$a")"; done
++# the port's run-time switches: the device-built verify plan, and no host handshakes in it. NO_HOST is for a card on
++# the xe driver (the host<->GPU flag stores are not visible there); an i915 card (Arc A-series) runs without it
++# (docs/INTEL.md)
++declare -A setting=([STRATA_VERIFY_DEVICE_PLAN]=1 [STRATA_VERIFY_NO_HOST]=1 [STRATA_STAGER_THREADS]=12)
++while IFS= read -r k; do
++    case "$k" in
++        STRATA_SYCL_*) ;;                                 # this script's own settings
++        STRATA_*|ONEAPI_*|UR_*|IGC_*|SYCL_*|ZES_*|NEOReadDebugKeys|OverrideDefaultFP64Settings) setting[$k]=${!k} ;;
++    esac
++done < <(compgen -e)
++envs=()
++for k in "${!setting[@]}"; do
++    # the engine tests the switches by presence: a value of 0 (or empty) means "not set", so it is not passed on
++    case "${setting[$k]}" in 0|"") ;; *) envs+=(-e "$k=${setting[$k]}") ;; esac
++done
++: "${STRATA_DPCPP_DIR:?set STRATA_DPCPP_DIR (docs/FOUR_GPU.md)}" "${STRATA_ONEAPI_RT:?set STRATA_ONEAPI_RT}" "${STRATA_CUDA_LIB:?set STRATA_CUDA_LIB}"
++exec docker run --rm -i --name "$name" --gpus all --device /dev/dri \
++    -v "$STRATA_DPCPP_DIR:/opt/dpcpp:ro" -v "$STRATA_ONEAPI_RT:/opt/oneapi-rt:ro" -v "$STRATA_CUDA_LIB:/opt/cuda-lib:ro" \
++    -e LD_LIBRARY_PATH=/opt/dpcpp/lib:/opt/oneapi-rt:/opt/cuda-lib --oom-score-adj 1000 --stop-timeout 30 --no-healthcheck \
++    --ulimit memlock=-1 -v /dev/shm:/dev/shm ${STRATA_SYCL_CPUSET:+--cpuset-cpus "$STRATA_SYCL_CPUSET"} \
++    -v "$root:/work" \
++    "${envs[@]}" \
++    "${STRATA_SYCL_IMAGE:-strata-sycl-4gpu}" \
++    "cd $repo_in && exec ${STRATA_SYCL_BIN:-build-sycl-4gpu/strata}$args"
+diff --git a/sycl/tools/Dockerfile.4gpu b/sycl/tools/Dockerfile.4gpu
+new file mode 100644
+index 0000000..89084f3
+--- /dev/null
++++ b/sycl/tools/Dockerfile.4gpu
+@@ -0,0 +1,11 @@
++# four-gpu runtime image (docs/FOUR_GPU.md): Ubuntu 24.04 with the CUDA runtime and Intel's Level Zero GPU runtime.
++# The engine itself runs on the open-source DPC++ runtime mounted at /opt/dpcpp (strata-sycl-4gpu.sh): its libumf
++# does not load on glibc 2.43 (Ubuntu 26.04, the strata-sycl-dev base), so this image stays on 24.04 (glibc 2.39).
++#   docker build -t strata-sycl-4gpu -f sycl/tools/Dockerfile.4gpu sycl/tools
++FROM nvidia/cuda:12.9.1-devel-ubuntu24.04
++ENV DEBIAN_FRONTEND=noninteractive
++RUN apt-get update && apt-get install -y --no-install-recommends software-properties-common gpg-agent ca-certificates \
++ && add-apt-repository -y ppa:kobuk-team/intel-graphics && apt-get update \
++ && apt-get install -y --no-install-recommends libze1 libze-intel-gpu1 intel-opencl-icd \
++ && rm -rf /var/lib/apt/lists/*
++ENTRYPOINT ["/bin/bash","-lc"]
+diff --git a/sycl/tools/stage_4gpu_runtime.sh b/sycl/tools/stage_4gpu_runtime.sh
+new file mode 100755
+index 0000000..d14eb78
+--- /dev/null
++++ b/sycl/tools/stage_4gpu_runtime.sh
+@@ -0,0 +1,16 @@
++#!/usr/bin/env bash
++# four-gpu: put together the host directories strata-sycl-4gpu.sh mounts (docs/FOUR_GPU.md).
++#   sycl/tools/stage_4gpu_runtime.sh <dir>     ->  <dir>/dpcpp  <dir>/oneapi-rt
++# dpcpp: the open-source DPC++ release (intel/llvm; its CUDA and Level Zero adapters, Unified Runtime 0.12 like
++# oneAPI 2026.1).  oneapi-rt: oneMKL's SYCL libraries and the compiler's math libraries, copied out of strata-sycl-dev
++# (Intel's licence; not redistributed here).
++set -euo pipefail
++out=${1:?usage: stage_4gpu_runtime.sh <dir>}
++DPCPP_TAG=${DPCPP_TAG:-v7.2.0}
++mkdir -p "$out/dpcpp" "$out/oneapi-rt"
++curl -fsSL "https://github.com/intel/llvm/releases/download/$DPCPP_TAG/sycl_linux.tar.gz" | tar xz -C "$out/dpcpp"
++docker run --rm -u "$(id -u):$(id -g)" -v "$out/oneapi-rt:/out" strata-sycl-dev "
++  cd /opt/intel/oneapi/mkl/latest/lib && cp -L libmkl_sycl_*.so.6 libmkl_intel_lp64.so.3 libmkl_sequential.so.3 \
++     libmkl_core.so.3 libmkl_avx2.so.3 libmkl_avx512.so.3 libmkl_def.so.3 libmkl_vml_*.so.3 /out/ &&
++  cd /opt/intel/oneapi/compiler/latest/lib && cp -L libsvml.so libirng.so libimf.so libintlc.so.5 /out/"
++ls "$out/dpcpp/lib/libur_adapter_cuda.so.0" >/dev/null && echo "staged: $out/dpcpp, $out/oneapi-rt"
+-- 
+2.53.0
+

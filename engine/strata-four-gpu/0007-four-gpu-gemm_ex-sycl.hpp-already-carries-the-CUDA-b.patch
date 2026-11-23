@@ -1,0 +1,26 @@
+From e7dfce2b9d7e0299d1ce190de6291cb379dae7e9 Mon Sep 17 00:00:00 2001
+From: AgentHub stack <noreply@example.invalid>
+Date: Mon, 19 Oct 2026 17:43:15 +0000
+Subject: [PATCH 07/17] four-gpu: gemm_ex - sycl.hpp already carries the CUDA
+ backend traits
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ sycl/include/strata/prefill/gemm_ex.hpp | 1 -
+ 1 file changed, 1 deletion(-)
+
+diff --git a/sycl/include/strata/prefill/gemm_ex.hpp b/sycl/include/strata/prefill/gemm_ex.hpp
+index ed32e99..cd91e9e 100644
+--- a/sycl/include/strata/prefill/gemm_ex.hpp
++++ b/sycl/include/strata/prefill/gemm_ex.hpp
+@@ -7,7 +7,6 @@
+ #include <dpct/blas_utils.hpp>
+ 
+ #if defined(STRATA_CUBLAS_INTEROP)
+-#include <sycl/ext/oneapi/experimental/backend/cuda.hpp>
+ #include <cublas_v2.h>
+ #include <cuda.h>
+ #include <cstdio>
+-- 
+2.53.0
+

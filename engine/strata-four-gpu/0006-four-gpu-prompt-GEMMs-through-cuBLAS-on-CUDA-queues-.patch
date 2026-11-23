@@ -1,0 +1,165 @@
+From ef33cc9f6815097d23b142ec4db899f64399dc7f Mon Sep 17 00:00:00 2001
+From: AgentHub stack <noreply@example.invalid>
+Date: Mon, 19 Oct 2026 17:23:50 +0000
+Subject: [PATCH 06/17] four-gpu: prompt GEMMs through cuBLAS on CUDA queues
+ (gemm_ex), oneMKL elsewhere
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ sycl/CMakeLists.txt                     |  9 +++
+ sycl/include/strata/prefill/gemm_ex.hpp | 83 +++++++++++++++++++++++++
+ sycl/src/prefill/gemm.dp.cpp            |  7 ++-
+ 3 files changed, 96 insertions(+), 3 deletions(-)
+ create mode 100644 sycl/include/strata/prefill/gemm_ex.hpp
+
+diff --git a/sycl/CMakeLists.txt b/sycl/CMakeLists.txt
+index a03edc0..7bd3a22 100644
+--- a/sycl/CMakeLists.txt
++++ b/sycl/CMakeLists.txt
+@@ -267,6 +267,15 @@ add_library(strata_prefill STATIC ${_prefill}
+             ${CMAKE_CURRENT_SOURCE_DIR}/src/prefill/xmx_moe.dp.cpp)      # A770 port: grouped XMX expert GEMM
+ target_compile_options(strata_prefill PUBLIC -qmkl=sequential)
+ target_link_options(strata_prefill PUBLIC -qmkl=sequential)
++if(STRATA_SYCL_NVPTX)   # four-gpu: the prompt GEMMs go to cuBLAS on NVIDIA cards (include/strata/prefill/gemm_ex.hpp)
++  set(_cuda_root "${STRATA_SYCL_CUDA_PATH}")
++  if(NOT _cuda_root)
++    set(_cuda_root /usr/local/cuda)
++  endif()
++  target_compile_definitions(strata_prefill PUBLIC STRATA_CUBLAS_INTEROP=1)
++  target_include_directories(strata_prefill PUBLIC ${_cuda_root}/include)
++  target_link_libraries(strata_prefill PUBLIC ${_cuda_root}/lib64/libcublas.so ${_cuda_root}/lib64/stubs/libcuda.so)
++endif()
+ target_link_libraries(strata_prefill PUBLIC strata_engine)
+ 
+ strata_resolve(_main src/program/generate.cpp)
+diff --git a/sycl/include/strata/prefill/gemm_ex.hpp b/sycl/include/strata/prefill/gemm_ex.hpp
+new file mode 100644
+index 0000000..ed32e99
+--- /dev/null
++++ b/sycl/include/strata/prefill/gemm_ex.hpp
+@@ -0,0 +1,83 @@
++// four-gpu: the prompt path's GEMMs on any card.  dpct::blas::gemm is oneMKL, which runs on Intel GPUs only; on a
++// CUDA queue (an NVIDIA card in a four-gpu build, STRATA_CUBLAS_INTEROP) the same call goes to cublasGemmEx on the
++// queue's own CUDA stream through a SYCL host_task.  Same arguments as dpct::blas::gemm, same column-major meaning.
++#pragma once
++#include <sycl/sycl.hpp>
++#include <dpct/dpct.hpp>
++#include <dpct/blas_utils.hpp>
++
++#if defined(STRATA_CUBLAS_INTEROP)
++#include <sycl/ext/oneapi/experimental/backend/cuda.hpp>
++#include <cublas_v2.h>
++#include <cuda.h>
++#include <cstdio>
++#include <map>
++#include <mutex>
++#endif
++
++namespace strata::prefill {
++
++#if defined(STRATA_CUBLAS_INTEROP)
++namespace detail {
++inline cudaDataType cuda_type(dpct::library_data_t t) {
++    switch (t) {
++        case dpct::library_data_t::real_half: return CUDA_R_16F;
++        case dpct::library_data_t::real_bfloat16: return CUDA_R_16BF;
++        default: return CUDA_R_32F;
++    }
++}
++inline cublasOperation_t cuda_op(oneapi::mkl::transpose t) {
++    return t == oneapi::mkl::transpose::nontrans ? CUBLAS_OP_N : CUBLAS_OP_T;
++}
++// one cuBLAS handle per CUDA context (each card's), made on first use inside that card's host_task
++inline cublasHandle_t cublas_for(CUcontext ctx) {
++    static std::mutex m;
++    static std::map<CUcontext, cublasHandle_t> handles;
++    std::lock_guard<std::mutex> g(m);
++    auto it = handles.find(ctx);
++    if (it != handles.end()) return it->second;
++    cublasHandle_t h = nullptr;
++    if (cublasCreate(&h) != CUBLAS_STATUS_SUCCESS) {
++        std::fprintf(stderr, "strata: cublasCreate failed\n");
++        return nullptr;
++    }
++    cublasSetMathMode(h, CUBLAS_DEFAULT_MATH);
++    handles[ctx] = h;
++    return h;
++}
++}  // namespace detail
++#endif
++
++inline int gemm_ex(dpct::blas::descriptor_ptr handle, oneapi::mkl::transpose ta, oneapi::mkl::transpose tb, int m,
++                   int n, int k, const float* alpha, const void* a, dpct::library_data_t at, int lda, const void* b,
++                   dpct::library_data_t bt, int ldb, const float* beta, void* c, dpct::library_data_t ct, int ldc,
++                   dpct::compute_type comp) {
++#if defined(STRATA_CUBLAS_INTEROP)
++    sycl::queue& q = handle->get_queue();
++    if (q.get_backend() == sycl::backend::ext_oneapi_cuda) {
++        const float al = *alpha, be = *beta;
++        q.submit([&](sycl::handler& h) {
++             h.host_task([=](sycl::interop_handle ih) {
++                 CUstream s = ih.get_native_queue<sycl::backend::ext_oneapi_cuda>();
++                 CUcontext ctx = nullptr;
++                 cuCtxGetCurrent(&ctx);
++                 cublasHandle_t cb = detail::cublas_for(ctx);
++                 if (cb == nullptr) return;
++                 cublasSetStream(cb, s);
++                 const cublasStatus_t st = cublasGemmEx(
++                     cb, detail::cuda_op(ta), detail::cuda_op(tb), m, n, k, &al, a, detail::cuda_type(at), lda, b,
++                     detail::cuda_type(bt), ldb, &be, c, detail::cuda_type(ct), ldc, CUBLAS_COMPUTE_32F,
++                     CUBLAS_GEMM_DEFAULT);
++                 if (st != CUBLAS_STATUS_SUCCESS)
++                     std::fprintf(stderr, "strata: cublasGemmEx failed (%d), m %d n %d k %d\n", (int) st, m, n, k);
++                 cuStreamSynchronize(s);   // a host_task ends when this returns: the stream's work must be done
++             });
++         });
++        return 0;
++    }
++#endif
++    return DPCT_CHECK_ERROR(dpct::blas::gemm(handle, ta, tb, m, n, k, alpha, a, at, lda, b, bt, ldb, beta, c, ct, ldc,
++                                             comp));
++}
++
++}  // namespace strata::prefill
+diff --git a/sycl/src/prefill/gemm.dp.cpp b/sycl/src/prefill/gemm.dp.cpp
+index 7035ca7..b917edd 100644
+--- a/sycl/src/prefill/gemm.dp.cpp
++++ b/sycl/src/prefill/gemm.dp.cpp
+@@ -6,6 +6,7 @@
+ #include "strata/prefill/gemm.hpp"
+ #include "strata/kernels/dequant_bf16.hpp"
+ #include <dpct/blas_utils.hpp>
++#include "strata/prefill/gemm_ex.hpp"   // four-gpu: cuBLAS on CUDA queues
+ 
+ #if defined(STRATA_PREFILL_MMQ) && defined(__HIPCC__)
+ #include "strata/prefill/moe_mmq.hpp"
+@@ -733,7 +734,7 @@ inline bool staged_gemm(sycl::queue& q, void* handle, const uint16_t* W, int lda
+     if (far_x) q.memcpy(sx, X, x_bytes);
+     const uint16_t* Wu = far_w ? (const uint16_t*) sw : W;
+     const uint16_t* Xu = far_x ? (const uint16_t*) sx : X;
+-    ck(DPCT_CHECK_ERROR(dpct::blas::gemm(
++    ck((strata::prefill::gemm_ex(
+            (dpct::blas::descriptor_ptr) handle, oneapi::mkl::transpose::trans, oneapi::mkl::transpose::nontrans,
+            (int) N, (int) T, (int) K, &alpha, Wu, dt, lda, Xu, dt, ldb, &beta, Y,
+            dpct::library_data_t::real_float, (int) ldy, dpct::compute_type::f32)),
+@@ -821,7 +822,7 @@ void Gemm::bf16(const uint16_t* X, const uint16_t* W, float* Y, int64_t T, int64
+                     alpha, beta, Y, ldy))
+         return;
+     // Column-major view: Y^T[N, T] = W[N, K] (stored K x N col-major, transposed) . X^T[K, T].
+-    ck(DPCT_CHECK_ERROR(dpct::blas::gemm(
++    ck((strata::prefill::gemm_ex(
+            (dpct::blas::descriptor_ptr)handle_, oneapi::mkl::transpose::trans,
+            oneapi::mkl::transpose::nontrans, (int)N, (int)T, (int)K, &alpha, W,
+            dpct::library_data_t::real_bfloat16, (int)K, X,
+@@ -860,7 +861,7 @@ void Gemm::f16(const uint16_t* X, const uint16_t* W, float* Y, int64_t T, int64_
+ #endif
+     if (staged_gemm(*strata::q_of(stream_), handle_, W, (int) K, X, (int) K, dpct::library_data_t::real_half, N, T, K, alpha, beta, Y, ldy))
+         return;
+-    ck(DPCT_CHECK_ERROR(dpct::blas::gemm(
++    ck((strata::prefill::gemm_ex(
+            (dpct::blas::descriptor_ptr)handle_, oneapi::mkl::transpose::trans,
+            oneapi::mkl::transpose::nontrans, (int)N, (int)T, (int)K, &alpha, W,
+            dpct::library_data_t::real_half, (int)K, X,
+-- 
+2.53.0
+

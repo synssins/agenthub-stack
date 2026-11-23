@@ -1,0 +1,173 @@
+From da8541b1556f092f80b97a5c558b5e04eb2fcb1e Mon Sep 17 00:00:00 2001
+From: AgentHub stack <noreply@example.invalid>
+Date: Mon, 19 Oct 2026 19:27:54 +0000
+Subject: [PATCH 12/17] serve: leave unusable tool entries out with a warning
+ instead of a 400 (Homarr / Vercel AI SDK provider-defined tools)
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ serve/frontend.py    | 39 +++++++++++++++++------
+ serve/test_server.py | 76 ++++++++++++++++++++++++++++++++++++++++++--
+ 2 files changed, 104 insertions(+), 11 deletions(-)
+
+diff --git a/serve/frontend.py b/serve/frontend.py
+index 3fda9c5..e2df8cd 100644
+--- a/serve/frontend.py
++++ b/serve/frontend.py
+@@ -474,11 +474,17 @@ def _stable_tool_order(tools: list[dict], name_of) -> list[dict]:
+ def _tool_list(value, wrapper: str | None) -> list[dict]:
+     """#592: a request's "tools" as a list of tool objects, each with a name - in the OpenAI shape
+     {"type": "function", "function": {"name": ...}} (`wrapper` "function"; a bare {"name": ...} is still taken), or
+-    in the Anthropic shape {"name": ...} (`wrapper` None).  A value that is not (a string such as "auto", a list of
+-    names, an object without a name) is a ValueError - a 400 naming the field - where it used to take the request
+-    thread down with no reply at all.  No value (or an empty one) is no tools, as always.  A tool's schema -
+-    "parameters" in the OpenAI shape, "input_schema" in the Anthropic one - is an object when it is there, for the
+-    same reason: a string or a list passed and raised later instead, on the model's first call of that tool."""
++    in the Anthropic shape {"name": ...} (`wrapper` None).  A value that is not a list of objects (a string such as
++    "auto", a list of names, a single object) is a ValueError - a 400 naming the field - where it used to take the
++    request thread down with no reply at all.  No value (or an empty one) is no tools, as always.
++
++    An entry that is not a usable function tool - another "type" (the Vercel AI SDK's provider-defined tools,
++    e.g. {"type": "provider-defined", "id": "x.web_search"}), a "function" that is not an object, no name or an
++    empty one - is left out with a warning naming it, as vLLM and llama.cpp do, instead of failing the whole request
++    (Homarr's assistant sent one such entry among its MCP tools and got a 400 for every message).  Left-out entries
++    never reach the template, parse_tool_call or the stream parser; when none is left the request has no tools.
++    A named tool's schema - "parameters" in the OpenAI shape, "input_schema" in the Anthropic one - is an object when
++    it is there: a string or a list passed and raised later instead, on the model's first call of that tool."""
+     if not value:
+         return []
+     shape = ('{"type": "function", "function": {"name": ..., "parameters": {...}}}' if wrapper else
+@@ -488,17 +494,32 @@ def _tool_list(value, wrapper: str | None) -> list[dict]:
+     except ValueError:
+         raise ValueError(f"tools must be a list of tool objects, each {shape}") from None
+     key = "parameters" if wrapper else "input_schema"
++
++    def fn_of(t: dict):
++        return t.get(wrapper, t) if wrapper and t.get("type") == wrapper else t
++
++    kept = []
+     for i, t in enumerate(tools):
+-        fn = t.get(wrapper, t) if wrapper and t.get("type") == wrapper else t
+-        if not isinstance(fn, dict) or not isinstance(fn.get("name"), str) or not fn["name"]:
+-            raise ValueError(f"tools[{i}] has no name: each tool must be {shape}")
++        kind = t.get("type")
++        fn = fn_of(t)
++        why = None
++        if wrapper and kind is not None and kind != wrapper:
++            why = f'type {kind!r} is not "{wrapper}"'
++        elif not isinstance(fn, dict):
++            why = f'"{wrapper}" is not an object'
++        elif not isinstance(fn.get("name"), str) or not fn["name"]:
++            why = "no name"
++        if why is not None:
++            print(f"[strata] tools[{i}] left out ({why}; each tool must be {shape}): {json.dumps(t)[:200]}", flush=True)
++            continue
+         schema = fn.get(key)
+         if schema is not None and not isinstance(schema, dict):
+             # it reached parse_tool_call and the stream parser as the tool's schema, whose .get("properties") raised
+             # AttributeError in the request thread - after the 200 and whatever the model had said before the call
+             raise ValueError(f'tools[{i}] ({fn["name"]}): "{key}" must be an object (the JSON schema of its '
+                              f"parameters), not {type(schema).__name__}")
+-    return _stable_tool_order(tools, lambda t: (t.get(wrapper, t) if wrapper and t.get("type") == wrapper else t)["name"])
++        kept.append(t)
++    return _stable_tool_order(kept, lambda t: fn_of(t)["name"])
+ 
+ 
+ def tool_arguments(raw) -> dict:
+diff --git a/serve/test_server.py b/serve/test_server.py
+index e68b44a..0d52cdf 100644
+--- a/serve/test_server.py
++++ b/serve/test_server.py
+@@ -1388,8 +1388,7 @@ class ClientShapes(unittest.TestCase):
+         # #592: a "tools" value that is not a list of named tool objects is a 400 naming the field, on both APIs,
+         # not a dropped connection (an AttributeError/TypeError in the request thread)
+         msgs = [{"role": "user", "content": "hi"}]
+-        bad = ("auto", ["get_weather"], [{"description": "no name"}], {"name": "x"},
+-               [{"type": "function", "function": "get_weather"}], [{"type": "function", "function": {"name": ""}}])
++        bad = ("auto", ["get_weather"], {"name": "x"})   # not a list of tool objects (unusable entries: MixedTools)
+         for path in ("/v1/chat/completions", "/v1/messages"):
+             for tools in bad:
+                 with self.subTest(path=path, tools=tools):
+@@ -5793,6 +5792,79 @@ class ClaudeCodeBillingStamp(unittest.TestCase):
+         self.assertEqual(ids[1][:len(first) - 8], first[:len(first) - 8])   # all but the generation header
+ 
+ 
++class MixedTools(unittest.TestCase):
++    """Homarr's assistant (Vercel AI SDK) sent one unusable entry among its MCP tools and every message was a 400.
++    Entries that are not usable function tools - no name, an empty one, a "function" that is not an object, another
++    "type" (the SDK's provider-defined tools) - are left out with a warning; the request goes on with the rest."""
++    GOOD = {"type": "function", "function": {"name": "get_time", "description": "time",
++                                            "parameters": {"type": "object", "properties": {"zone": {"type": "string"}}}}}
++    MIXED = [GOOD, {"type": "function", "function": {"name": "", "parameters": {"type": "object", "properties": {}}}},
++             {"type": "provider-defined", "id": "x.web_search", "args": {}},
++             {"type": "function", "function": "nope"}, {"description": "no name at all"}]
++
++    @classmethod
++    def setUpClass(cls):
++        tok = ByteTokenizer()
++        cls.engine = RecordingPrompt(tok, "</think>\n\n<tool_call>\n<function=get_time>\n<parameter=zone>\nUTC\n"
++                                          "</parameter>\n</function>\n</tool_call>", max_context=CTX)
++        cls.svc = Service(cls.engine, tok, ChatTemplate(ROOT / "serve/chat_template.jinja"))
++        cls.httpd = serve(cls.svc, port=0)
++        cls.base = f"http://127.0.0.1:{cls.httpd.server_address[1]}"
++
++    @classmethod
++    def tearDownClass(cls):
++        cls.httpd.shutdown()
++        cls.httpd.server_close()
++
++    def post(self, path, body, raw=False):
++        req = urllib.request.Request(self.base + path, data=json.dumps(body).encode(),
++                                     headers={"Content-Type": "application/json", "anthropic-version": "2023-06-01"})
++        try:
++            with urllib.request.urlopen(req, timeout=30) as r:
++                data = r.read()
++                return r.status, (data.decode() if raw else json.loads(data))
++        except urllib.error.HTTPError as e:
++            with e:
++                return e.code, json.loads(e.read())
++
++    def prompt_text(self):
++        return bytes(i for i in self.engine.last_ids if i < 256).decode("utf-8", "replace")
++
++    def body(self, **kw):
++        return {"model": "x", "max_tokens": 512, "messages": [{"role": "user", "content": "What time is it?"}],
++                "tools": self.MIXED, **kw}
++
++    def test_mixed_tools_are_a_200_with_only_the_usable_ones(self):
++        status, b = self.post("/v1/chat/completions", self.body())
++        self.assertEqual(status, 200, b)
++        prompt = self.prompt_text()
++        self.assertIn("get_time", prompt)
++        self.assertNotIn("x.web_search", prompt)
++        self.assertNotIn("no name at all", prompt)
++        choice = b["choices"][0]
++        self.assertEqual(choice["finish_reason"], "tool_calls")
++        calls = choice["message"]["tool_calls"]
++        self.assertEqual([c["function"]["name"] for c in calls], ["get_time"])
++        self.assertEqual(json.loads(calls[0]["function"]["arguments"]), {"zone": "UTC"})
++
++    def test_mixed_tools_stream(self):
++        status, text = self.post("/v1/chat/completions", self.body(stream=True), raw=True)
++        self.assertEqual(status, 200, text)
++        self.assertIn('"get_time"', text)
++        self.assertIn("[DONE]", text)
++
++    def test_anthropic_shape_and_nothing_usable(self):
++        msgs = [{"role": "user", "content": "hi"}]
++        status, b = self.post("/v1/messages", {"model": "x", "max_tokens": 8, "messages": msgs, "tools": [
++            {"name": "get_time", "input_schema": {"type": "object"}}, {"description": "no name"}]})
++        self.assertEqual(status, 200, b)
++        self.assertIn("get_time", self.prompt_text())
++        status, b = self.post("/v1/chat/completions", {"model": "x", "max_tokens": 8, "messages": msgs, "tools": [
++            {"type": "provider-defined", "id": "x.web_search"}, {"type": "function", "function": {"name": ""}}]})
++        self.assertEqual(status, 200, b)                # nothing usable left: as if no tools were sent
++        self.assertNotIn("x.web_search", self.prompt_text())
++
++
+ class ToolOrder(unittest.TestCase):
+     """A tool set that comes back in another order is put back in the order it was first seen (RealScaniX, #1624): the
+     template renders the tool list before the system prompt, so a client whose MCP tools register in a varying order
+-- 
+2.53.0
+

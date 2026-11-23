@@ -1,0 +1,25 @@
+From ddc2d721f084578af93cec1cdb9b218f01fe7c42 Mon Sep 17 00:00:00 2001
+From: AgentHub stack <noreply@example.invalid>
+Date: Mon, 19 Oct 2026 19:30:27 +0000
+Subject: [PATCH 14/17] four-gpu: docs/FOUR_GPU.md notes the Monitor fix
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ docs/FOUR_GPU.md | 1 +
+ 1 file changed, 1 insertion(+)
+
+diff --git a/docs/FOUR_GPU.md b/docs/FOUR_GPU.md
+index 8b4cc35..42b772b 100644
+--- a/docs/FOUR_GPU.md
++++ b/docs/FOUR_GPU.md
+@@ -48,6 +48,7 @@ registers, and each Intel/NVIDIA boundary is a host copy. See "Not done" for wha
+ |---|---|
+ | `sycl/serve/strata-sycl-4gpu.sh` | the `exe` for the config: `strata-sycl.sh` plus `--gpus all`, the open-source DPC++ runtime and oneMKL/cuBLAS libs mounted and on `LD_LIBRARY_PATH`, host `/dev/shm` shared (image embeddings), optional `--cpuset-cpus` |
+ | `sycl/tools/Dockerfile.4gpu` | runtime image: `nvidia/cuda:12.9.1-devel-ubuntu24.04` + Level Zero GPU runtime (kobuk-team PPA) |
++| `sycl/serve/server_intel.py` (d02ce0a) | the Monitor numbers a mixed split's NVIDIA cards after the Intel ones (NVML index = index - Intel cards); before, they were asked under their split index, named no card and were left out |
+ | `sycl/tools/stage_4gpu_runtime.sh` | fetches intel/llvm `v7.2.0` `sycl_linux.tar.gz`; copies oneMKL SYCL + compiler math libs out of `strata-sycl-dev` |
+ 
+ Why a separate runtime: Intel's oneAPI 2026.1 runtime loads the open-source CUDA adapter but calls
+-- 
+2.53.0
+

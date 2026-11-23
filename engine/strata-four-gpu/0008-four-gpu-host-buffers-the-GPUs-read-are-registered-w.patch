@@ -1,0 +1,617 @@
+From 82b76e04b2dca3aae38a31b379f9356eb5f3b72d Mon Sep 17 00:00:00 2001
+From: AgentHub stack <noreply@example.invalid>
+Date: Mon, 19 Oct 2026 17:55:42 +0000
+Subject: [PATCH 08/17] four-gpu: host buffers the GPUs read are registered
+ with CUDA too (strata::malloc_host)
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ sycl/CMakeLists.txt                           |  6 ++
+ sycl/include/strata/host_visible.hpp          | 62 +++++++++++++++++++
+ sycl/include/strata/sycl_queue.hpp            |  6 +-
+ sycl/src/core/conversation_snapshot_test.cpp  |  3 +-
+ sycl/src/core/expert_source.cpp               |  5 +-
+ sycl/src/core/gguf_expert_source.cpp          |  3 +-
+ sycl/src/core/layer.cpp                       |  9 +--
+ sycl/src/core/native_head.cpp                 |  3 +-
+ sycl/src/core/remote_experts.cpp              |  7 ++-
+ sycl/src/core/verify.cpp                      |  5 +-
+ sycl/src/core/weights.cpp                     |  5 +-
+ sycl/src/kernels/cuda/verify_kernels.dp.cpp   |  3 +-
+ sycl/src/kernels/kv_stream_parity.cpp         |  3 +-
+ sycl/src/kernels/native_grouped_parity.cpp    |  3 +-
+ sycl/src/kernels/s2_expert_grouped_parity.cpp |  3 +-
+ sycl/src/prefill/prefill.cpp                  | 17 ++---
+ sycl/src/program/generate.cpp                 | 13 ++--
+ 17 files changed, 120 insertions(+), 36 deletions(-)
+ create mode 100644 sycl/include/strata/host_visible.hpp
+
+diff --git a/sycl/CMakeLists.txt b/sycl/CMakeLists.txt
+index 7bd3a22..1523e8e 100644
+--- a/sycl/CMakeLists.txt
++++ b/sycl/CMakeLists.txt
+@@ -62,6 +62,12 @@ if(STRATA_SYCL_AOT)
+     if(STRATA_SYCL_CUDA_PATH)
+       list(APPEND _sycl_nv --cuda-path=${STRATA_SYCL_CUDA_PATH})
+     endif()
++    add_compile_definitions(STRATA_FOUR_GPU=1)   # host buffers registered with CUDA too (strata/host_visible.hpp)
++    if(STRATA_SYCL_CUDA_PATH)
++      include_directories(${STRATA_SYCL_CUDA_PATH}/include)
++    else()
++      include_directories(/usr/local/cuda/include)
++    endif()
+     if(STRATA_SYCL_NVPTX MATCHES "^sm_7")   # Turing/Volta: no m16n8k16 f16 MMA, no cp.async
+       list(APPEND _sycl_nv -Xsycl-target-frontend=nvptx64-nvidia-cuda -DSTRATA_NVPTX_TURING=1)
+     endif()
+diff --git a/sycl/include/strata/host_visible.hpp b/sycl/include/strata/host_visible.hpp
+new file mode 100644
+index 0000000..e0331a2
+--- /dev/null
++++ b/sycl/include/strata/host_visible.hpp
+@@ -0,0 +1,62 @@
++// four-gpu: host memory that every card can read.  The engine hands GPUs host buffers to read directly (mapped
++// staging: the layer split's hand-off rows, the window's inputs, the CPU pool's rows).  Allocated through an Intel
++// card's queue they are Level Zero host memory, which a CUDA card cannot address; registered with CUDA as portable
++// pinned memory (cuMemHostRegister) the same address is valid in every CUDA context as well (unified addressing).
++// Without an NVIDIA card in the process (or outside a four-gpu build, STRATA_FOUR_GPU) these are sycl::malloc_host.
++#pragma once
++#include <sycl/sycl.hpp>
++#include <cstddef>
++
++#if defined(STRATA_FOUR_GPU)
++#include <cuda.h>
++#include <cstdio>
++#include <mutex>
++#endif
++
++namespace strata {
++
++#if defined(STRATA_FOUR_GPU)
++namespace detail {
++// a CUDA context to register in (the first NVIDIA card's primary context), or nullptr without one
++inline CUcontext cuda_register_ctx() {
++    static CUcontext ctx = [] {
++        bool any = false;
++        for (const auto& d : sycl::device::get_devices(sycl::info::device_type::gpu))
++            any |= d.get_backend() == sycl::backend::ext_oneapi_cuda;
++        CUcontext c = nullptr;
++        CUdevice dev;
++        if (any && cuInit(0) == CUDA_SUCCESS && cuDeviceGet(&dev, 0) == CUDA_SUCCESS)
++            cuDevicePrimaryCtxRetain(&c, dev);
++        return c;
++    }();
++    return ctx;
++}
++}  // namespace detail
++
++inline void make_host_visible(void* p, size_t bytes) {
++    CUcontext ctx = detail::cuda_register_ctx();
++    if (p == nullptr || bytes == 0 || ctx == nullptr) return;
++    cuCtxPushCurrent(ctx);
++    const CUresult r = cuMemHostRegister(p, bytes, CU_MEMHOSTREGISTER_PORTABLE | CU_MEMHOSTREGISTER_DEVICEMAP);
++    if (r != CUDA_SUCCESS && r != CUDA_ERROR_HOST_MEMORY_ALREADY_REGISTERED)
++        std::fprintf(stderr, "strata: four-gpu: cuMemHostRegister of %zu bytes failed (%d)\n", bytes, (int) r);
++    CUcontext prev;
++    cuCtxPopCurrent(&prev);
++}
++#else
++inline void make_host_visible(void*, size_t) {}
++#endif
++
++inline void* malloc_host(size_t bytes, const sycl::queue& q) {
++    void* p = sycl::malloc_host(bytes, q);
++    make_host_visible(p, bytes);
++    return p;
++}
++template <typename T>
++inline T* malloc_host(size_t count, const sycl::queue& q) {
++    T* p = sycl::malloc_host<T>(count, q);
++    make_host_visible(p, count * sizeof(T));
++    return p;
++}
++
++}  // namespace strata
+diff --git a/sycl/include/strata/sycl_queue.hpp b/sycl/include/strata/sycl_queue.hpp
+index 3b92cac..7b2bf56 100644
+--- a/sycl/include/strata/sycl_queue.hpp
++++ b/sycl/include/strata/sycl_queue.hpp
+@@ -5,6 +5,7 @@
+ // q_of() is that cast with CUDA's null-stream meaning restored: the default in-order queue.
+ #pragma once
+ #include <sycl/sycl.hpp>
++#include "strata/host_visible.hpp"
+ #include <dpct/dpct.hpp>
+ #include <cstdlib>
+ 
+@@ -44,7 +45,7 @@ inline void big_fill_zero(sycl::queue& q, void* p, size_t bytes, size_t chunk =
+ // system-scope atomics: every ring wait runs to its bound and the window reads stale rows (NaN logits). Host memory
+ // from zeMemAllocHost with ZE_HOST_MEM_ALLOC_FLAG_BIAS_UNCACHED does work there (sycl/probe/doorbell.cpp mode 2,
+ // "HANDSHAKE OK"), so those buffers come from it when the Level Zero headers are present (libze-dev), else from
+-// sycl::malloc_host. STRATA_HOST_UNCACHED=0 turns it off.
++// strata::malloc_host. STRATA_HOST_UNCACHED=0 turns it off.
+ #if defined(__has_include)
+ #if __has_include(<level_zero/ze_api.h>) && __has_include(<sycl/ext/oneapi/backend/level_zero.hpp>)
+ #include <level_zero/ze_api.h>
+@@ -68,13 +69,14 @@ inline void* host_malloc_polled(size_t bytes, sycl::queue& q) {
+         ze_host_mem_alloc_desc_t d{ZE_STRUCTURE_TYPE_HOST_MEM_ALLOC_DESC, nullptr, ZE_HOST_MEM_ALLOC_FLAG_BIAS_UNCACHED};
+         void* p = nullptr;
+         if (zeMemAllocHost(ctx, &d, bytes, 64, &p) == ZE_RESULT_SUCCESS && p != nullptr) {
++            make_host_visible(p, bytes);   // four-gpu: readable by NVIDIA cards too
+             std::lock_guard<std::mutex> lk(detail::uncached_mu());
+             detail::uncached_set().insert(p);
+             return p;
+         }
+     }
+ #endif
+-    return sycl::malloc_host(bytes, q);
++    return strata::malloc_host(bytes, q);
+ }
+ inline void host_free_polled(void* p, sycl::queue& q) {
+     if (p == nullptr) return;
+diff --git a/sycl/src/core/conversation_snapshot_test.cpp b/sycl/src/core/conversation_snapshot_test.cpp
+index c7e7095..f9793d6 100644
+--- a/sycl/src/core/conversation_snapshot_test.cpp
++++ b/sycl/src/core/conversation_snapshot_test.cpp
+@@ -1,5 +1,6 @@
+ #define DPCT_PROFILING_ENABLED
+ #include <sycl/sycl.hpp>
++#include "strata/host_visible.hpp"
+ #include <dpct/dpct.hpp>
+ #include "strata/core/conversation_snapshot.hpp"
+ #include "strata/core/conversation_file.hpp"
+@@ -48,7 +49,7 @@ struct Fixture {
+             meaningful in the migrated code and was removed or replaced with 0.
+             You may need to check the migrated code.
+             */
+-            cuda_check(DPCT_CHECK_ERROR(raw = (void *)sycl::malloc_host(
++            cuda_check(DPCT_CHECK_ERROR(raw = (void *)strata::malloc_host(
+                                             n, dpct::get_in_order_queue())));
+             host.push_back(raw);
+             void* mapped = nullptr;
+diff --git a/sycl/src/core/expert_source.cpp b/sycl/src/core/expert_source.cpp
+index e0bb0f2..6fb4e28 100644
+--- a/sycl/src/core/expert_source.cpp
++++ b/sycl/src/core/expert_source.cpp
+@@ -1,6 +1,7 @@
+ // src/core/expert_source.cpp - the adapter.  See the header for the three clauses of the contract.
+ #define DPCT_PROFILING_ENABLED
+ #include <sycl/sycl.hpp>
++#include "strata/host_visible.hpp"
+ #include <dpct/dpct.hpp>
+ #include "strata/sycl_queue.hpp"
+ #include "strata/core/expert_source.hpp"
+@@ -1859,7 +1860,7 @@ bool FileExpertSource::pin_cache_complement(
+         std::fflush(stderr);
+         if (pin) {
+             const dpct::err0 allocated = DPCT_CHECK_ERROR(
+-                arena = (void *)sycl::malloc_host((size_t)bytes,
++                arena = (void *)strata::malloc_host((size_t)bytes,
+                                                   dpct::get_in_order_queue()));
+             if (allocated == 0) {
+                 void* alias = nullptr;
+@@ -2223,7 +2224,7 @@ bool FileExpertSource::reserve_exchanges(int64_t n, std::string& err) {
+     migrated code and was removed or replaced with 0. You may need to check the
+     migrated code.
+     */
+-    if (DPCT_CHECK_ERROR(p = (void *)sycl::malloc_host(
++    if (DPCT_CHECK_ERROR(p = (void *)strata::malloc_host(
+                              total, dpct::get_in_order_queue())) == 0 &&
+         p != nullptr) {
+         xstage_pinned_ = true;
+diff --git a/sycl/src/core/gguf_expert_source.cpp b/sycl/src/core/gguf_expert_source.cpp
+index af1bda1..50ae96d 100644
+--- a/sycl/src/core/gguf_expert_source.cpp
++++ b/sycl/src/core/gguf_expert_source.cpp
+@@ -10,6 +10,7 @@
+ #include <unistd.h>
+ #include <dpct/dpct.hpp>
+ #include <sycl/sycl.hpp>
++#include "strata/host_visible.hpp"
+ #include <thread>
+ 
+ namespace strata::core {
+@@ -151,7 +152,7 @@ int64_t GgufExpertSource::mirror(const std::vector<std::pair<int64_t, int64_t>>&
+             const uint64_t want = std::max(b, std::min<uint64_t>(kChunk, total - placed));
+             uint8_t* nc = nullptr;
+             try {
+-                nc = (uint8_t*) sycl::malloc_host((size_t) want, dpct::get_in_order_queue());
++                nc = (uint8_t*) strata::malloc_host((size_t) want, dpct::get_in_order_queue());
+             } catch (const sycl::exception& ex) {
+                 err = std::string("mirror: ") + ex.what();
+             }
+diff --git a/sycl/src/core/layer.cpp b/sycl/src/core/layer.cpp
+index 78adeb5..8488a4f 100644
+--- a/sycl/src/core/layer.cpp
++++ b/sycl/src/core/layer.cpp
+@@ -2,6 +2,7 @@
+ // src/core/layer.cpp - the GDN layer, composed.  See the header for the operation order and its traps.
+ #define DPCT_PROFILING_ENABLED
+ #include <sycl/sycl.hpp>
++#include "strata/host_visible.hpp"
+ #include <dpct/dpct.hpp>
+ #include "strata/sycl_queue.hpp"
+ #include "strata/core/layer.hpp"
+@@ -878,7 +879,7 @@ uint64_t qsa_state_init(const ModelGeometry& g, int64_t max_cells, void* base, Q
+     st.pos_dev = c.take<int32_t>((uint64_t) s.n_head);
+     // the pinned staging the uploads copy FROM - see the note on `host_step` in the header
+     if (DPCT_CHECK_ERROR(
+-            st.host_step = (int32_t *)sycl::malloc_host(
++            st.host_step = (int32_t *)strata::malloc_host(
+                 strata::kernels::qsa_step_bytes() + sizeof(int32_t),
+                 dpct::get_in_order_queue())) != 0 ||
+         /*
+@@ -892,7 +893,7 @@ uint64_t qsa_state_init(const ModelGeometry& g, int64_t max_cells, void* base, Q
+         check the migrated code.
+         */
+         DPCT_CHECK_ERROR(
+-            st.host_pos = (int32_t *)sycl::malloc_host(
++            st.host_pos = (int32_t *)strata::malloc_host(
+                 (size_t)s.n_head * 4, dpct::get_in_order_queue())) != 0) {
+         return 0;   // the caller sees a zero byte count; a half-built state is worse than none
+     }
+@@ -914,7 +915,7 @@ uint64_t qsa_state_init(const ModelGeometry& g, int64_t max_cells, void* base, Q
+         in the migrated code and was removed or replaced with 0. You may need to
+         check the migrated code.
+         */
+-        if (DPCT_CHECK_ERROR(h = (uint8_t *)sycl::malloc_host(
++        if (DPCT_CHECK_ERROR(h = (uint8_t *)strata::malloc_host(
+                                  bytes, dpct::get_in_order_queue())) != 0 ||
+             DPCT_CHECK_ERROR(*(void **)&d = (uint8_t *)h) != 0) {
+             // under WSL the NVIDIA driver pins only ~1 GiB in all, which is less than 128K of 8-bit KV needs
+@@ -1368,7 +1369,7 @@ migrated code.
+ */
+ auto alloc = [&](size_t n, void** h, void** d, const char* what) {
+                                                                           try {
+-if (DPCT_CHECK_ERROR(*h = (void *)sycl::malloc_host(n, dpct::get_in_order_queue())) != 0) {            std::fprintf(stderr, "doorbell_init: cudaHostAlloc(%s) failed\n", what);            return false;        }        if (DPCT_CHECK_ERROR(*d = (void *)*h) != 0) {            std::fprintf(stderr, "doorbell_init: cudaHostGetDevicePointer(%s) failed\n", what);            return false;        }        std::memset(*h, 0, n);        bytes += n;        return true;    }
++if (DPCT_CHECK_ERROR(*h = (void *)strata::malloc_host(n, dpct::get_in_order_queue())) != 0) {            std::fprintf(stderr, "doorbell_init: cudaHostAlloc(%s) failed\n", what);            return false;        }        if (DPCT_CHECK_ERROR(*d = (void *)*h) != 0) {            std::fprintf(stderr, "doorbell_init: cudaHostGetDevicePointer(%s) failed\n", what);            return false;        }        std::memset(*h, 0, n);        bytes += n;        return true;    }
+ catch (sycl::exception const &exc) {
+   std::cerr << exc.what() << "Exception caught at file:" << __FILE__
+             << ", line:" << __LINE__ << std::endl;
+diff --git a/sycl/src/core/native_head.cpp b/sycl/src/core/native_head.cpp
+index c04375f..6da5edd 100644
+--- a/sycl/src/core/native_head.cpp
++++ b/sycl/src/core/native_head.cpp
+@@ -1,5 +1,6 @@
+ #define DPCT_PROFILING_ENABLED
+ #include <sycl/sycl.hpp>
++#include "strata/host_visible.hpp"
+ #include <dpct/dpct.hpp>
+ #include "strata/sycl_queue.hpp"
+ #include "strata/core/native_head.hpp"
+@@ -204,7 +205,7 @@ bool NativeEmbed::load(const std::vector<std::string> &shards, int64_t n_embd,
+         in the migrated code and was removed or replaced with 0. You may need to
+         check the migrated code.
+         */
+-        if (DPCT_CHECK_ERROR(host_ = (void *)sycl::malloc_host(
++        if (DPCT_CHECK_ERROR(host_ = (void *)strata::malloc_host(
+                                  bytes_, dpct::get_in_order_queue())) != 0) {
+             // Under WSL2 the driver's pinned/mapped host budget (~1 GiB) can be spent by the GPU contexts
+             // themselves (three cards). The table is only gathered from, so keep it in the current device's VRAM
+diff --git a/sycl/src/core/remote_experts.cpp b/sycl/src/core/remote_experts.cpp
+index 2473463..1402ab1 100644
+--- a/sycl/src/core/remote_experts.cpp
++++ b/sycl/src/core/remote_experts.cpp
+@@ -1,4 +1,5 @@
+ #include <sycl/sycl.hpp>
++#include "strata/host_visible.hpp"
+ #include <dpct/dpct.hpp>
+ #include "strata/core/remote_experts.hpp"
+ 
+@@ -254,7 +255,7 @@ bool RemoteExperts::open(int device, int slots, int64_t layers, int64_t experts,
+         check the migrated code.
+         */
+         check(
+-            DPCT_CHECK_ERROR(h_x_ = sycl::malloc_host<float>(
++            DPCT_CHECK_ERROR(h_x_ = strata::malloc_host<float>(
+                                  (size_t)CAP * H, dpct::get_in_order_queue())),
+             "input staging", err, device) &&
+         /*
+@@ -268,7 +269,7 @@ bool RemoteExperts::open(int device, int slots, int64_t layers, int64_t experts,
+         check the migrated code.
+         */
+         check(
+-            DPCT_CHECK_ERROR(h_out_ = sycl::malloc_host<float>(
++            DPCT_CHECK_ERROR(h_out_ = strata::malloc_host<float>(
+                                  (size_t)CAP * H, dpct::get_in_order_queue())),
+             "result staging", err, device) &&
+         /*
+@@ -277,7 +278,7 @@ bool RemoteExperts::open(int device, int slots, int64_t layers, int64_t experts,
+         check the migrated code.
+         */
+         check(DPCT_CHECK_ERROR(
+-                  h_meta_ = (void *)sycl::malloc_host(
++                  h_meta_ = (void *)strata::malloc_host(
+                       sizeof(RemoteMeta), dpct::get_in_order_queue())),
+               "metadata staging", err, device) &&
+         check(
+diff --git a/sycl/src/core/verify.cpp b/sycl/src/core/verify.cpp
+index 1d7501f..8cc2b52 100644
+--- a/sycl/src/core/verify.cpp
++++ b/sycl/src/core/verify.cpp
+@@ -1,6 +1,7 @@
+ // src/core/verify.cpp - see include/strata/core/verify.hpp.
+ #define DPCT_PROFILING_ENABLED
+ #include <sycl/sycl.hpp>
++#include "strata/host_visible.hpp"
+ #include <dpct/dpct.hpp>
+ #include "strata/sycl_queue.hpp"
+ #include "strata/core/verify.hpp"
+@@ -235,7 +236,7 @@ bool mapped(size_t bytes, void **h, void **d) try {
+     // polled by the window's kernels: uncached host memory (sycl_queue.hpp); a buffer only read or written between
+     // kernels (the stepped window's payload) is ordinary host USM
+     if (DPCT_CHECK_ERROR(*h = window_host_uncached() ? strata::host_malloc_polled(bytes, dpct::get_in_order_queue())
+-                                     : sycl::malloc_host(bytes, dpct::get_in_order_queue())) !=
++                                     : strata::malloc_host(bytes, dpct::get_in_order_queue())) !=
+         0 || *h == nullptr) return false;
+     std::memset(*h, 0, bytes);
+     return DPCT_CHECK_ERROR(*d = (void *)*h) == 0;
+@@ -3589,7 +3590,7 @@ bool Verifier::capture_all(std::string &err) try {
+         the migrated code and was removed or replaced with 0. You may need to
+         check the migrated code.
+         */
+-        DPCT_CHECK_ERROR(prof_pin_ = (unsigned long long *)sycl::malloc_host(
++        DPCT_CHECK_ERROR(prof_pin_ = (unsigned long long *)strata::malloc_host(
+                              prof_h_.size() * 8, dpct::get_in_order_queue())) !=
+             0) {
+         prof_pin_ = nullptr;   // the pipelined windows go unprofiled
+diff --git a/sycl/src/core/weights.cpp b/sycl/src/core/weights.cpp
+index 5741893..8470c2d 100644
+--- a/sycl/src/core/weights.cpp
++++ b/sycl/src/core/weights.cpp
+@@ -1,6 +1,7 @@
+ // src/core/weights.cpp - the dense-weight loader.  See the header for the engine-vs-pack distinction.
+ #define DPCT_PROFILING_ENABLED
+ #include <sycl/sycl.hpp>
++#include "strata/host_visible.hpp"
+ #include <dpct/dpct.hpp>
+ #include "strata/core/weights.hpp"
+ 
+@@ -230,14 +231,14 @@ bool WeightTable::load(const std::string &pack_dir, void *arena_base,
+     migrated code and was removed or replaced with 0. You may need to check the
+     migrated code.
+     */
+-    if (DPCT_CHECK_ERROR(stage_in = (void *)sycl::malloc_host(
++    if (DPCT_CHECK_ERROR(stage_in = (void *)strata::malloc_host(
+                              CHUNK, dpct::get_in_order_queue())) != 0 ||
+         /*
+         DPCT1048: The original value cudaHostAllocDefault is not meaningful in
+         the migrated code and was removed or replaced with 0. You may need to
+         check the migrated code.
+         */
+-        DPCT_CHECK_ERROR(stage_out = (void *)sycl::malloc_host(
++        DPCT_CHECK_ERROR(stage_out = (void *)strata::malloc_host(
+                              CHUNK * 2, dpct::get_in_order_queue())) != 0) {
+         err = "cudaHostAlloc for the staging buffers failed";
+         if (stage_in) sycl::free(stage_in, dpct::get_in_order_queue());
+diff --git a/sycl/src/kernels/cuda/verify_kernels.dp.cpp b/sycl/src/kernels/cuda/verify_kernels.dp.cpp
+index 99851d4..9f03ad9 100644
+--- a/sycl/src/kernels/cuda/verify_kernels.dp.cpp
++++ b/sycl/src/kernels/cuda/verify_kernels.dp.cpp
+@@ -4,6 +4,7 @@
+ // elementwise.cu) with the same operation order, so a verify window reproduces plain decode bit for bit.
+ #define DPCT_PROFILING_ENABLED
+ #include <sycl/sycl.hpp>
++#include "strata/host_visible.hpp"
+ #include "strata/core/geometry.hpp"
+ #include <dpct/dpct.hpp>
+ #include "strata/sycl_queue.hpp"
+@@ -2512,7 +2513,7 @@ struct ProfileHostClock {
+     std::atomic<bool> stop{false};
+     std::thread writer;
+     explicit ProfileHostClock(const sycl::queue& q) : context(q.get_context()),
+-        word(sycl::malloc_host<uint64_t>(8, context)) {
++        word(strata::malloc_host<uint64_t>(8, context)) {
+         if (!word) throw std::runtime_error("gpu_stamp: host clock allocation failed");
+         __atomic_store_n(word, profile_now_ns(), __ATOMIC_RELEASE);
+         writer = std::thread([this] {
+diff --git a/sycl/src/kernels/kv_stream_parity.cpp b/sycl/src/kernels/kv_stream_parity.cpp
+index 759b821..0ce62ef 100644
+--- a/sycl/src/kernels/kv_stream_parity.cpp
++++ b/sycl/src/kernels/kv_stream_parity.cpp
+@@ -12,6 +12,7 @@
+ // copy written through kv_hybrid_k_half / kv_hybrid_v_half.
+ #define DPCT_PROFILING_ENABLED
+ #include <sycl/sycl.hpp>
++#include "strata/host_visible.hpp"
+ #include <dpct/dpct.hpp>
+ #include "strata/kernels/kv_q4.hpp"
+ #include "strata/kernels/kv_q8.hpp"
+@@ -56,7 +57,7 @@ template <typename T> T* halloc(size_t n) {   // pinned, mapped; returns the dev
+     migrated code and was removed or replaced with 0. You may need to check the
+     migrated code.
+     */
+-    ck(DPCT_CHECK_ERROR(h = (void *)sycl::malloc_host(
++    ck(DPCT_CHECK_ERROR(h = (void *)strata::malloc_host(
+                             n * sizeof(T) + 64, dpct::get_in_order_queue())),
+        "hostalloc");
+     std::memset(h, 0, n * sizeof(T) + 64);
+diff --git a/sycl/src/kernels/native_grouped_parity.cpp b/sycl/src/kernels/native_grouped_parity.cpp
+index 60a61a3..11ffdce 100644
+--- a/sycl/src/kernels/native_grouped_parity.cpp
++++ b/sycl/src/kernels/native_grouped_parity.cpp
+@@ -14,6 +14,7 @@
+ // set, small enough that the SwiGLU outputs keep a finite fp16 q8_1 scale.
+ #define DPCT_PROFILING_ENABLED
+ #include <sycl/sycl.hpp>
++#include "strata/host_visible.hpp"
+ #include <dpct/dpct.hpp>
+ #include "strata/kernels/iq_kernels.hpp"
+ 
+@@ -636,7 +637,7 @@ void kq_bench(dpct::queue_ptr s, std::mt19937& rng, int nl, bool host) {
+             Setup S(pr[0], pr[1], 2560, 640, sh.T, 10, 28, rng, s);
+             const int ng = S.plan_sizes(*sh.sizes, 0, rng);
+             // host: the arena in pinned host memory, read by the kernels over PCIe (the B70's mirrored experts)
+-            uint8_t* arena = host ? (uint8_t*) sycl::malloc_host(S.slot * (size_t) (nl * ng) + 256, dpct::get_in_order_queue())
++            uint8_t* arena = host ? (uint8_t*) strata::malloc_host(S.slot * (size_t) (nl * ng) + 256, dpct::get_in_order_queue())
+                                   : dalloc<uint8_t>(S.slot * (size_t) (nl * ng));
+             std::vector<unsigned long long*> lp;
+             for (int l = 0; l < nl; ++l) {
+diff --git a/sycl/src/kernels/s2_expert_grouped_parity.cpp b/sycl/src/kernels/s2_expert_grouped_parity.cpp
+index e19261c..fce0d72 100644
+--- a/sycl/src/kernels/s2_expert_grouped_parity.cpp
++++ b/sycl/src/kernels/s2_expert_grouped_parity.cpp
+@@ -25,6 +25,7 @@
+ // kernels agreeing on garbage would otherwise pass.
+ #define DPCT_PROFILING_ENABLED
+ #include <sycl/sycl.hpp>
++#include "strata/host_visible.hpp"
+ #include <dpct/dpct.hpp>
+ #include "strata/kernels/f16_bits.hpp"
+ #include "strata/kernels/s2_expert_grouped.hpp"
+@@ -407,7 +408,7 @@ void check_all() {
+         the migrated code and was removed or replaced with 0. You may need to
+         check the migrated code.
+         */
+-        ck(DPCT_CHECK_ERROR(h_host = (uint8_t *)sycl::malloc_host(
++        ck(DPCT_CHECK_ERROR(h_host = (uint8_t *)strata::malloc_host(
+                                 BLOB, dpct::get_in_order_queue())),
+            "host blob");
+         std::memcpy(h_host, fx.hb(fx.nb - 1), BLOB);
+diff --git a/sycl/src/prefill/prefill.cpp b/sycl/src/prefill/prefill.cpp
+index 9b7c125..9fc5d48 100644
+--- a/sycl/src/prefill/prefill.cpp
++++ b/sycl/src/prefill/prefill.cpp
+@@ -1,6 +1,7 @@
+ // src/prefill/prefill.cpp - see include/strata/prefill/prefill.hpp.
+ #define DPCT_PROFILING_ENABLED
+ #include <sycl/sycl.hpp>
++#include "strata/host_visible.hpp"
+ #include <dpct/dpct.hpp>
+ #include "strata/sycl_queue.hpp"
+ #include "strata/copy_queue.hpp"
+@@ -387,10 +388,10 @@ struct Stager {
+         pinned.assign((size_t) kRing, 0);
+         dma_done.assign((size_t) kRing, nullptr);
+         want.assign((size_t) kRing, 0);
+-        done_seq = sycl::malloc_host<uint64_t>((size_t) kRing, dpct::get_in_order_queue());
++        done_seq = strata::malloc_host<uint64_t>((size_t) kRing, dpct::get_in_order_queue());
+         if (done_seq == nullptr) return false;
+         for (int i = 0; i < kRing; ++i) done_seq[i] = 0;
+-        src_seq = sycl::malloc_host<uint64_t>((size_t) 4 * kRing, dpct::get_in_order_queue());
++        src_seq = strata::malloc_host<uint64_t>((size_t) 4 * kRing, dpct::get_in_order_queue());
+         if (src_seq == nullptr) return false;
+         for (int i = 0; i < 4 * kRing; ++i) src_seq[i] = 0;
+         pageable.resize(kRing);
+@@ -402,7 +403,7 @@ struct Stager {
+             */
+             pinned[i] = !force_pageable() &&
+                         DPCT_CHECK_ERROR(
+-                            buf[i] = (unsigned char *)sycl::malloc_host(
++                            buf[i] = (unsigned char *)strata::malloc_host(
+                                 blob_bytes, dpct::get_in_order_queue())) == 0;
+             if (!pinned[i]) {
+                 /*
+@@ -957,7 +958,7 @@ bool Prefill::init(const core::WeightTable &wt, const core::ModelGeometry &g,
+         */
+         if (!m.hand[b] &&
+             DPCT_CHECK_ERROR(
+-                m.hand[b] = (float *)sycl::malloc_host(
++                m.hand[b] = (float *)strata::malloc_host(
+                     (size_t)chunk * D * 4, dpct::get_in_order_queue())) != 0) {
+             err = "prefill: the layer split's hand-off buffers";
+             return false;
+@@ -1042,7 +1043,7 @@ bool Prefill::init(const core::WeightTable &wt, const core::ModelGeometry &g,
+                 meaningful in the migrated code and was removed or replaced with
+                 0. You may need to check the migrated code.
+                 */
+-                DPCT_CHECK_ERROR(h = (void *)sycl::malloc_host(
++                DPCT_CHECK_ERROR(h = (void *)strata::malloc_host(
+                                      need * 4, dpct::get_in_order_queue())) ==
+                     0 &&
+                 DPCT_CHECK_ERROR(d = (void *)h) == 0) {
+@@ -1068,7 +1069,7 @@ bool Prefill::init(const core::WeightTable &wt, const core::ModelGeometry &g,
+             */
+             (force_pageable() ||
+              DPCT_CHECK_ERROR(
+-                 m.ple_emb_host[b] = (float *)sycl::malloc_host(
++                 m.ple_emb_host[b] = (float *)strata::malloc_host(
+                      (size_t)T * N * 4, dpct::get_in_order_queue())) != 0)) {
+             /*
+             DPCT1026: The call to cudaGetLastError was removed because this
+@@ -1082,7 +1083,7 @@ bool Prefill::init(const core::WeightTable &wt, const core::ModelGeometry &g,
+             DPCT_CHECK_ERROR(m.ple_copied[b] = new sycl::event()) != 0)
+             ok = false;
+         if (!m.ple_done_seq) {
+-            m.ple_done_seq = sycl::malloc_host<uint64_t>(2, dpct::get_in_order_queue());
++            m.ple_done_seq = strata::malloc_host<uint64_t>(2, dpct::get_in_order_queue());
+             if (m.ple_done_seq) m.ple_done_seq[0] = m.ple_done_seq[1] = 0;
+             else ok = false;
+         }
+@@ -1660,7 +1661,7 @@ bool Prefill::bind_stage_helper(int64_t T) {
+             You may need to check the migrated code.
+             */
+             if (DPCT_CHECK_ERROR(
+-                    p = (std::remove_reference_t<decltype(p)>)sycl::malloc_host(
++                    p = (std::remove_reference_t<decltype(p)>)strata::malloc_host(
+                         n * sizeof(*p), dpct::get_in_order_queue())) != 0) {
+                 /*
+                 DPCT1026: The call to cudaGetLastError was removed because
+diff --git a/sycl/src/program/generate.cpp b/sycl/src/program/generate.cpp
+index 5794a27..97703a8 100644
+--- a/sycl/src/program/generate.cpp
++++ b/sycl/src/program/generate.cpp
+@@ -23,6 +23,7 @@
+ 
+ #define DPCT_PROFILING_ENABLED
+ #include <sycl/sycl.hpp>
++#include "strata/host_visible.hpp"
+ #include <dpct/dpct.hpp>
+ #include "strata/sycl_queue.hpp"
+ #include "strata/sycl_doorbell.hpp"
+@@ -1538,7 +1539,7 @@ double probe_pcie_h2d_gbps(std::string *samples = nullptr, bool pin_source = fal
+     void* d = nullptr;
+     // PR #1669: a pageable source made the copy engine fault on a layer split (VM_NOT_FOUND), so a split pins it. A single card keeps the
+     // pageable source of 0.1.41: pinned reads 1.7x faster, which moves the default pcie_frac (A750 0.28 -> 0.47, 10% slower decode).
+-    if (DPCT_CHECK_ERROR(h = pin_source ? (void *)sycl::malloc_host(kBytes, dpct::get_in_order_queue()) : (void *)malloc(kBytes)) != 0 || h == nullptr) return -1.0;
++    if (DPCT_CHECK_ERROR(h = pin_source ? (void *)strata::malloc_host(kBytes, dpct::get_in_order_queue()) : (void *)malloc(kBytes)) != 0 || h == nullptr) return -1.0;
+     if (DPCT_CHECK_ERROR(d = (void *)sycl::malloc_device(
+                              kBytes, dpct::get_in_order_queue())) != 0) {
+         if (pin_source) sycl::free(h, dpct::get_in_order_queue()); else free(h);
+@@ -3014,7 +3015,7 @@ int main(int argc, char **argv) try {
+         in the migrated code and was removed or replaced with 0. You may need to
+         check the migrated code.
+         */
+-        if (DPCT_CHECK_ERROR(half_stage = sycl::malloc_host<float>(
++        if (DPCT_CHECK_ERROR(half_stage = strata::malloc_host<float>(
+                                  n, dpct::get_in_order_queue())) != 0) {
+             std::fprintf(stderr, "strata generate: cannot pin the half-dump staging buffer\n");
+             return 1;
+@@ -4749,7 +4750,7 @@ int main(int argc, char **argv) try {
+             constexpr size_t kBatch = 64;
+             const size_t blob_cap = (size_t) lay.max_blob;
+             sycl::queue& q = dpct::get_in_order_queue();
+-            uint8_t* pin = sycl::malloc_host<uint8_t>(2 * kBatch * blob_cap, q);
++            uint8_t* pin = strata::malloc_host<uint8_t>(2 * kBatch * blob_cap, q);
+             if (pin == nullptr) {
+                 std::fprintf(stderr, "strata generate: the profile fill could not pin %zu MiB\n",
+                              (2 * kBatch * blob_cap) >> 20);
+@@ -5549,7 +5550,7 @@ int main(int argc, char **argv) try {
+         in the migrated code and was removed or replaced with 0. You may need to
+         check the migrated code.
+         */
+-        if (DPCT_CHECK_ERROR(layer_stage = sycl::malloc_host<float>(
++        if (DPCT_CHECK_ERROR(layer_stage = strata::malloc_host<float>(
+                                  layer_floats, dpct::get_in_order_queue())) !=
+             0) {
+             std::fprintf(stderr, "strata generate: cannot pin the layer-dump staging buffer\n");
+@@ -7181,7 +7182,7 @@ int main(int argc, char **argv) try {
+                 meaningful in the migrated code and was removed or replaced with
+                 0. You may need to check the migrated code.
+                 */
+-                if (DPCT_CHECK_ERROR(hh = (float *)sycl::malloc_host(
++                if (DPCT_CHECK_ERROR(hh = (float *)strata::malloc_host(
+                                          hb, dpct::get_in_order_queue())) !=
+                         0 ||
+                     DPCT_CHECK_ERROR(*(void **)&h = (float *)hh) != 0) {
+@@ -7249,7 +7250,7 @@ int main(int argc, char **argv) try {
+             meaningful in the migrated code and was removed or replaced with 0.
+             You may need to check the migrated code.
+             */
+-            if (DPCT_CHECK_ERROR(hh = (float *)sycl::malloc_host(
++            if (DPCT_CHECK_ERROR(hh = (float *)strata::malloc_host(
+                                      hb, dpct::get_in_order_queue())) != 0 ||
+                 DPCT_CHECK_ERROR(*(void **)&hand_b = (float *)hh) != 0) {
+                 std::fprintf(stderr, "strata serve: --pipeline-windows: the second hand-off allocation failed\n");
+-- 
+2.53.0
+

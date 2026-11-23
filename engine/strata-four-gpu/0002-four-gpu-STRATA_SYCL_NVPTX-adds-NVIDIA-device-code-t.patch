@@ -1,0 +1,49 @@
+From 60e0b3ffb057da1265b18478eb0a052b1936ca9c Mon Sep 17 00:00:00 2001
+From: AgentHub stack <noreply@example.invalid>
+Date: Mon, 19 Oct 2026 15:30:33 +0000
+Subject: [PATCH 02/17] four-gpu: STRATA_SYCL_NVPTX adds NVIDIA device code to
+ the Intel AOT build
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ sycl/CMakeLists.txt | 22 +++++++++++++++++++---
+ 1 file changed, 19 insertions(+), 3 deletions(-)
+
+diff --git a/sycl/CMakeLists.txt b/sycl/CMakeLists.txt
+index fd42efb..a4b54ef 100644
+--- a/sycl/CMakeLists.txt
++++ b/sycl/CMakeLists.txt
+@@ -42,11 +42,27 @@ if(STRATA_SYCL_AOT MATCHES "^(bmg|lnl)")
+ elseif(STRATA_SYCL_AOT MATCHES "^pvc")
+   add_compile_definitions(STRATA_NO_DG2_XMX=1)   # the grouped XMX kernels (sub-group 8, 8x8x16) do not compile for Xe2 / Xe-HPC
+ endif()
++# four-gpu: STRATA_SYCL_NVPTX=sm_75 (with an AOT build) adds NVIDIA device code beside the Intel AOT code, so one
++# engine drives Intel and NVIDIA cards together; STRATA_SYCL_CUDA_PATH names the CUDA toolkit for it.
++set(STRATA_SYCL_NVPTX "" CACHE STRING "four-gpu: also build for NVIDIA, e.g. sm_75 (empty: Intel only)")
++set(STRATA_SYCL_CUDA_PATH "" CACHE PATH "four-gpu: the CUDA toolkit for STRATA_SYCL_NVPTX")
+ if(STRATA_SYCL_AOT)
+-  list(APPEND _sycl_flags -fsycl-targets=spir64_gen)
++  set(_sycl_targets spir64_gen)
++  set(_sycl_nv "")
++  if(STRATA_SYCL_NVPTX)
++    string(APPEND _sycl_targets ",nvptx64-nvidia-cuda")
++    list(APPEND _sycl_nv -Xsycl-target-backend=nvptx64-nvidia-cuda --cuda-gpu-arch=${STRATA_SYCL_NVPTX} -Wno-unknown-cuda-version)
++    if(STRATA_SYCL_CUDA_PATH)
++      list(APPEND _sycl_nv --cuda-path=${STRATA_SYCL_CUDA_PATH})
++    endif()
++    if(STRATA_SYCL_NVPTX MATCHES "^sm_7")   # Turing/Volta: no m16n8k16 f16 MMA, no cp.async
++      list(APPEND _sycl_nv -Xsycl-target-frontend=nvptx64-nvidia-cuda -DSTRATA_NVPTX_TURING=1)
++    endif()
++  endif()
++  list(APPEND _sycl_flags -fsycl-targets=${_sycl_targets} ${_sycl_nv})
+   # the divide/sqrt rounding option (below) must reach ocloc here: an AOT build has no spir64 backend to take it
+-  set(_sycl_link -fsycl -fsycl-targets=spir64_gen -Xsycl-target-backend=spir64_gen
+-      "-device ${STRATA_SYCL_AOT} -options -cl-fp32-correctly-rounded-divide-sqrt")
++  set(_sycl_link -fsycl -fsycl-targets=${_sycl_targets} -Xsycl-target-backend=spir64_gen
++      "-device ${STRATA_SYCL_AOT} -options -cl-fp32-correctly-rounded-divide-sqrt" ${_sycl_nv})
+ else()
+   set(_sycl_link -fsycl)
+ endif()
+-- 
+2.53.0
+

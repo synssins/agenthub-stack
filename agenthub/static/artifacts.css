@@ -1,0 +1,206 @@
+/* Shared code artifacts: message card + right side panel (artifacts.js).
+   Colours only from the theme tokens in style.css. */
+
+.artifact-card {
+    display: block;
+    margin: 6px 0;
+    width: 640px;
+    max-width: 100%;
+    border: 1px solid var(--border);
+    border-radius: var(--radius-lg);
+    background: var(--code-bg);
+    cursor: pointer;
+    overflow: hidden;
+    transition: border-color var(--duration-fast);
+}
+.artifact-card:empty { min-height: 96px; }
+.artifact-card:hover { border-color: var(--border-strong); }
+.artifact-card:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
+.artifact-card-missing {
+    min-height: 0;
+    padding: 8px 12px;
+    color: var(--text-dim);
+    font-size: var(--fs-sm);
+    cursor: default;
+}
+
+.artifact-card-head {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    padding: 8px 12px;
+    border-bottom: 1px solid var(--border-subtle);
+}
+.artifact-card-icon { display: flex; color: var(--accent); flex-shrink: 0; }
+.artifact-card-title {
+    color: var(--text-strong);
+    font-weight: var(--fw-semibold);
+    font-size: var(--fs-md);
+    min-width: 0;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+}
+.artifact-card-meta {
+    margin-left: auto;
+    color: var(--text-dim);
+    font-size: var(--fs-xs);
+    white-space: nowrap;
+}
+
+.artifact-card-preview {
+    width: 0;          /* long lines must not widen the message bubble */
+    min-width: 100%;
+    margin: 0;
+    padding: 8px 12px 0;
+    border: none;
+    border-radius: 0;
+    background: none;
+    white-space: pre;
+    overflow: hidden;
+    max-height: 6.5em;
+    -webkit-mask-image: linear-gradient(to bottom, black 35%, transparent);
+    mask-image: linear-gradient(to bottom, black 35%, transparent);
+    opacity: 0.85;
+}
+.artifact-card-preview code.hljs {
+    display: block;
+    background: none;
+    padding: 0;
+    font-family: 'Cascadia Code', 'JetBrains Mono', 'Fira Code', 'Consolas', monospace;
+    font-size: var(--fs-sm);
+    line-height: 1.3;
+}
+
+.artifact-card-actions {
+    display: flex;
+    gap: 6px;
+    padding: 6px 12px 10px;
+}
+
+.artifact-btn {
+    display: inline-flex;
+    align-items: center;
+    gap: 6px;
+    padding: 4px 10px;
+    border: 1px solid var(--border);
+    border-radius: var(--radius-md);
+    background: var(--bg-elevated);
+    color: var(--text);
+    font: inherit;
+    font-size: var(--fs-sm);
+    cursor: pointer;
+    transition: border-color var(--duration-fast), color var(--duration-fast);
+}
+.artifact-btn:hover { border-color: var(--accent); color: var(--text-strong); }
+
+.artifact-icon-btn {
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    width: 30px;
+    height: 30px;
+    flex-shrink: 0;
+    border: 1px solid var(--border);
+    border-radius: var(--radius-md);
+    background: none;
+    color: var(--text-dim);
+    cursor: pointer;
+    transition: border-color var(--duration-fast), color var(--duration-fast);
+}
+.artifact-icon-btn:hover { border-color: var(--accent); color: var(--text); }
+
+/* --- Side panel: slides over the right side of the chat, under the header --- */
+
+.artifact-panel {
+    position: fixed;
+    right: 0;
+    bottom: 0;
+    z-index: 900;
+    width: min(760px, 92vw);
+    display: flex;
+    flex-direction: column;
+    background: var(--bg-elevated);
+    border-left: 1px solid var(--border-strong);
+    box-shadow: var(--shadow-lg);
+    transform: translateX(16px);
+    opacity: 0;
+    transition: transform var(--duration-normal) ease-out, opacity var(--duration-normal) ease-out;
+}
+.artifact-panel[hidden] { display: none; }
+.artifact-panel.open { transform: none; opacity: 1; }
+
+.artifact-panel-head {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    padding: 10px 12px 10px 16px;
+    border-bottom: 1px solid var(--border);
+    background: var(--bg-header);
+    flex-shrink: 0;
+}
+.artifact-panel-titles { flex: 1; min-width: 0; }
+.artifact-panel-title {
+    font-size: var(--fs-base);
+    font-weight: var(--fw-semibold);
+    color: var(--text-strong);
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+}
+.artifact-panel-sub {
+    margin-top: 2px;
+    font-size: var(--fs-xs);
+    color: var(--text-dim);
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+}
+.artifact-version {
+    max-width: 180px;
+    padding: 4px 6px;
+    border: 1px solid var(--border);
+    border-radius: var(--radius-md);
+    background: var(--bg-input);
+    color: var(--text);
+    font: inherit;
+    font-size: var(--fs-sm);
+}
+.artifact-version[hidden] { display: none; }
+
+.artifact-panel-body {
+    flex: 1;
+    min-height: 0;
+    overflow: auto;
+    background: var(--code-bg);
+}
+.artifact-code {
+    display: grid;
+    grid-template-columns: auto 1fr;
+    min-width: max-content;
+    font-family: 'Cascadia Code', 'JetBrains Mono', 'Fira Code', 'Consolas', monospace;
+    font-size: var(--fs-sm);
+    line-height: 1.55;
+}
+.artifact-gutter {
+    position: sticky;
+    left: 0;
+    padding: 12px 10px 12px 14px;
+    text-align: right;
+    white-space: pre;
+    color: var(--text-system);
+    background: var(--code-bg);
+    border-right: 1px solid var(--border-subtle);
+    user-select: none;
+    -webkit-user-select: none;
+}
+.artifact-code pre { margin: 0; padding: 12px 16px; white-space: pre; }
+.artifact-code code.hljs { background: none; padding: 0; font: inherit; color: var(--text); }
+
+@media (max-width: 640px) {
+    .artifact-panel { left: 0; width: auto; border-left: none; }
+    .artifact-panel-head { gap: 6px; padding-left: 12px; }
+    .artifact-version { max-width: 96px; }
+    .artifact-panel-head .artifact-btn { padding: 0; width: 30px; height: 30px; justify-content: center; }
+    .artifact-panel-head .artifact-btn span { display: none; }
+}

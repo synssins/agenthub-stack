@@ -1,0 +1,37 @@
+/* Agent activity: the live working card and the collapsed "Worked for ..." steps on a reply */
+.act-card { min-width: 260px; }
+.act-live-state { display: inline-flex; align-items: center; gap: 6px; color: var(--text-dim); font-size: 0.82em; }
+.act-dot { width: 7px; height: 7px; border-radius: 50%; background: var(--accent); animation: act-pulse 1.4s ease-in-out infinite; }
+@keyframes act-pulse { 50% { opacity: 0.3; } }
+
+.act-wrap { margin: 4px 0 6px; font-size: 0.86em; }
+.act-wrap-sum { cursor: pointer; color: var(--text-dim); user-select: none; list-style-position: inside; }
+.act-wrap-sum:hover { color: var(--text); }
+.act-list { display: flex; flex-direction: column; gap: 2px; margin: 4px 0 0 4px; padding-left: 8px; border-left: 2px solid var(--border); }
+
+.act-step > summary { cursor: pointer; display: flex; align-items: baseline; gap: 8px; min-width: 0; padding: 1px 0; list-style: none; }
+.act-step > summary::-webkit-details-marker { display: none; }
+.act-step > summary::before { content: '▸'; color: var(--text-dim); flex-shrink: 0; }
+.act-step[open] > summary::before { content: '▾'; }
+.act-kind { font-weight: 600; color: var(--text); flex-shrink: 0; }
+.act-brief { color: var(--text-dim); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; min-width: 0; font-family: var(--font-mono, monospace); font-size: 0.95em; }
+.act-sub { margin-left: 14px; opacity: 0.85; }
+.act-err .act-kind, .act-flag { color: var(--error-color); }
+.act-flag { font-size: 0.85em; flex-shrink: 0; }
+.act-spin { width: 9px; height: 9px; border: 2px solid var(--border); border-top-color: var(--accent); border-radius: 50%; animation: act-spin 0.8s linear infinite; flex-shrink: 0; align-self: center; }
+@keyframes act-spin { to { transform: rotate(360deg); } }
+
+.act-body { margin: 4px 0 6px 14px; }
+.act-label { color: var(--text-dim); font-size: 0.85em; margin-top: 4px; }
+.act-pre { margin: 2px 0; padding: 6px 8px; max-height: 280px; overflow: auto; white-space: pre-wrap; word-break: break-word;
+    background: var(--bg-input); border: 1px solid var(--border); border-radius: var(--radius-sm); font-size: 0.92em; }
+.act-think { font-style: italic; color: var(--text-dim); font-family: inherit; }
+.act-note { color: var(--text); padding: 2px 0; }
+.act-note p { margin: 0 0 4px; }
+.act-status { color: var(--text-dim); font-style: italic; padding: 1px 0; }
+.act-text:empty { display: none; }
+
+@media (prefers-reduced-motion: reduce) { .act-dot, .act-spin { animation: none; } }
+
+.act-usage { margin-top: 4px; color: var(--text-dim); font-size: var(--fs-xs); font-variant-numeric: tabular-nums; }
+.act-usage-label { display: inline-block; min-width: 4.2em; color: var(--text-system); }

@@ -1,0 +1,29 @@
+From 589b971bc73d6d792816565451bf55852bda222f Mon Sep 17 00:00:00 2001
+From: AgentHub stack <noreply@example.invalid>
+Date: Mon, 19 Oct 2026 16:25:28 +0000
+Subject: [PATCH 04/17] four-gpu: pass the NVPTX register cap to ptxas at top
+ level
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ sycl/CMakeLists.txt | 4 ++--
+ 1 file changed, 2 insertions(+), 2 deletions(-)
+
+diff --git a/sycl/CMakeLists.txt b/sycl/CMakeLists.txt
+index b517088..a03edc0 100644
+--- a/sycl/CMakeLists.txt
++++ b/sycl/CMakeLists.txt
+@@ -56,8 +56,8 @@ if(STRATA_SYCL_AOT)
+     list(APPEND _sycl_nv "SHELL:-Xsycl-target-backend=nvptx64-nvidia-cuda --cuda-gpu-arch=${STRATA_SYCL_NVPTX}"
+          -Wno-unknown-cuda-version)
+     if(STRATA_SYCL_NVPTX_MAXRREG)   # 1024-item work-groups (no __launch_bounds__ after dpct) need <= 64 registers
+-      list(APPEND _sycl_nv "SHELL:-Xsycl-target-backend=nvptx64-nvidia-cuda -Xcuda-ptxas"
+-           "SHELL:-Xsycl-target-backend=nvptx64-nvidia-cuda --maxrregcount=${STRATA_SYCL_NVPTX_MAXRREG}")
++      # top-level -Xcuda-ptxas: the form the SYCL driver hands to ptxas (through -Xsycl-target-backend it does not)
++      list(APPEND _sycl_nv "SHELL:-Xcuda-ptxas --maxrregcount=${STRATA_SYCL_NVPTX_MAXRREG}")
+     endif()
+     if(STRATA_SYCL_CUDA_PATH)
+       list(APPEND _sycl_nv --cuda-path=${STRATA_SYCL_CUDA_PATH})
+-- 
+2.53.0
+

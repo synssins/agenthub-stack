@@ -1,0 +1,148 @@
+From 4b6d049ab9678d1db5d137840b94106aaad3d390 Mon Sep 17 00:00:00 2001
+From: AgentHub stack <noreply@example.invalid>
+Date: Mon, 19 Oct 2026 18:24:05 +0000
+Subject: [PATCH 10/17] four-gpu: per-vendor layer-split hand-off buffers,
+ copied by the host across an Intel/NVIDIA boundary
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ sycl/include/strata/core/verify.hpp | 10 ++++++
+ sycl/src/core/verify.cpp            |  5 +--
+ sycl/src/program/generate.cpp       | 48 +++++++++++++++++------------
+ 3 files changed, 42 insertions(+), 21 deletions(-)
+
+diff --git a/sycl/include/strata/core/verify.hpp b/sycl/include/strata/core/verify.hpp
+index 894f7b7..d690286 100644
+--- a/sycl/include/strata/core/verify.hpp
++++ b/sycl/include/strata/core/verify.hpp
+@@ -20,6 +20,7 @@
+ // Requires the default native decode configuration (native projections, fused GR, fused GDN, fast attention and
+ // selection, native indexer) and a profile-filled VRAM expert tier with its residency table on the device.
+ #pragma once
++#include <cstring>
+ #include <functional>
+ 
+ #include <sycl/sycl.hpp>
+@@ -124,6 +125,10 @@ public:
+     /// The next stage: `run` and `commit` continue into it (its pool calls get `next_user`); sampling settings
+     /// and `final_R` are the last stage's.
+     void set_next(Verifier* next, void* next_user) { next_ = next; next_user_ = next_user; }
++    /// four-gpu: the next stage reads its hand-off from `peer` (`bytes` long) - its own vendor's host memory, when the
++    /// two stages are an Intel and an NVIDIA card (neither can address the other's host allocations).  The host copies
++    /// the written hand-off there before the next stage runs.
++    void set_hand_peer(float* peer, size_t bytes) { hand_peer_ = peer; hand_peer_bytes_ = bytes; }
+     /// floats per token in a hand-off buffer
+     static int64_t handoff_floats(const ModelGeometry& g) { return (int64_t) g.hc * g.n_embd + g.n_embd + g.hc; }
+ 
+@@ -347,6 +352,11 @@ private:
+     int64_t lb_ = 0, le_ = -1;           ///< set_stage: the layers this verifier runs (-1: to the last)
+     const float* hand_in_ = nullptr;
+     float* hand_out_ = nullptr;
++    float* hand_peer_ = nullptr;          ///< four-gpu: set_hand_peer
++    size_t hand_peer_bytes_ = 0;
++    void hand_sync() const {              ///< four-gpu: the written hand-off into the next stage's own buffer
++        if (hand_peer_ != nullptr && hand_out_ != nullptr) std::memcpy(hand_peer_, hand_out_, hand_peer_bytes_);
++    }
+     Verifier* next_ = nullptr;
+     void* next_user_ = nullptr;
+     bool ple_stage() const { return lb_ <= 1 && 1 < le_; }   ///< holds layer 1, where the PLE block runs
+diff --git a/sycl/src/core/verify.cpp b/sycl/src/core/verify.cpp
+index 8cc2b52..28bab8c 100644
+--- a/sycl/src/core/verify.cpp
++++ b/sycl/src/core/verify.cpp
+@@ -2413,6 +2413,7 @@ bool Verifier::run(int T, const int32_t *tokens, int64_t pos0, PoolMultiFn pool,
+     // the drafts were. Exact: a rejected row's draw is discarded, and no kept decision depends on a reused draw.
+     if (le_ < g.n_layers) {   // a layer split's earlier stage: the hand-off is written (synced above)
+         ++windows;
++        hand_sync();
+         return next_ == nullptr || next_->run(T, tokens, pos0, pool, next_user_, out, err);
+     }
+     const bool sampled = !sampling_.greedy && sampling_.temperature > 0.0f;
+@@ -3165,7 +3166,7 @@ bool Verifier::run_slot_rows(const int *rows, int S, const int32_t *tokens,
+         copy_->wait();
+         if (prof_on_) collect_profile();
+         ++windows;
+-        if (le_ < g.n_layers) return next_ == nullptr || next_->run_slot_rows(rows, S, tokens, pos, pool, next_user_, out, err);
++        if (le_ < g.n_layers) { hand_sync(); return next_ == nullptr || next_->run_slot_rows(rows, S, tokens, pos, pool, next_user_, out, err); }
+         if (!sample_rows(S, err)) return false;
+         for (int t = 0; t < S; ++t) out[t] = ((volatile int32_t*) h_out_)[t];
+         progress_at("decode");
+@@ -3248,7 +3249,7 @@ bool Verifier::run_slot_rows(const int *rows, int S, const int32_t *tokens,
+     copy_->wait();
+     if (prof_on_) collect_profile();
+     ++windows;
+-    if (le_ < g.n_layers) return next_ == nullptr || next_->run_slot_rows(rows, S, tokens, pos, pool, next_user_, out, err);
++    if (le_ < g.n_layers) { hand_sync(); return next_ == nullptr || next_->run_slot_rows(rows, S, tokens, pos, pool, next_user_, out, err); }
+     if (!sample_rows(S, err)) return false;
+     for (int t = 0; t < S; ++t) out[t] = ((volatile int32_t*) h_out_)[t];
+     progress_at("decode");
+diff --git a/sycl/src/program/generate.cpp b/sycl/src/program/generate.cpp
+index 97703a8..2214de0 100644
+--- a/sycl/src/program/generate.cpp
++++ b/sycl/src/program/generate.cpp
+@@ -7169,33 +7169,43 @@ int main(int argc, char **argv) try {
+         if (n_stages > 1) {
+             const size_t hb = (size_t) strata::kernels::kVerifyMaxT *
+                               (size_t) strata::core::Verifier::handoff_floats(g) * sizeof(float);
+-            std::vector<float*> hand((size_t) n_stages - 1, nullptr);
+-            for (float*& h : hand) {
+-                float* hh = nullptr;
+-                /*
+-                DPCT1048: The original value cudaHostAllocMapped is not
+-                meaningful in the migrated code and was removed or replaced with
+-                0. You may need to check the migrated code.
+-                */
+-                /*
+-                DPCT1048: The original value cudaHostAllocPortable is not
+-                meaningful in the migrated code and was removed or replaced with
+-                0. You may need to check the migrated code.
+-                */
+-                if (DPCT_CHECK_ERROR(hh = (float *)strata::malloc_host(
+-                                         hb, dpct::get_in_order_queue())) !=
+-                        0 ||
+-                    DPCT_CHECK_ERROR(*(void **)&h = (float *)hh) != 0) {
++            // four-gpu: each hand-off is allocated through its writing stage's card; when the reading stage is on the
++            // other vendor (Intel <-> NVIDIA: neither addresses the other's host memory) it gets its own buffer through
++            // its card, and the writer's verifier copies the hand-off across before the reader runs (set_hand_peer).
++            auto host_on = [&](int st, size_t bytes) -> float* {
++                auto alloc = [&]() -> float* {
++                    float* p = (float*) strata::malloc_host(bytes, dpct::get_in_order_queue());
++                    if (p != nullptr) std::memset(p, 0, bytes);
++                    return p;
++                };
++                if (st == 0) return alloc();
++                const strata::core::OnDevice on(stages[(size_t) st - 1]->dev);
++                return alloc();
++            };
++            auto backend_on = [&](int st) {
++                if (st == 0) return dpct::get_in_order_queue().get_backend();
++                const strata::core::OnDevice on(stages[(size_t) st - 1]->dev);
++                return dpct::get_in_order_queue().get_backend();
++            };
++            std::vector<float*> hand((size_t) n_stages - 1, nullptr), hand_in((size_t) n_stages - 1, nullptr);
++            for (int b = 0; b + 1 < n_stages; ++b) {
++                hand[(size_t) b] = host_on(b, hb);
++                hand_in[(size_t) b] = backend_on(b) == backend_on(b + 1) ? hand[(size_t) b] : host_on(b + 1, hb);
++                if (hand[(size_t) b] == nullptr || hand_in[(size_t) b] == nullptr) {
+                     std::fprintf(stderr, "strata serve: the layer-split hand-off allocation failed\n");
+                     return 1;
+                 }
+-                std::memset(hh, 0, hb);
++                if (hand_in[(size_t) b] != hand[(size_t) b]) {
++                    stage_ver(b).set_hand_peer(hand_in[(size_t) b], hb);
++                    std::fprintf(stderr, "strata serve: layer split: stages %d -> %d cross vendors, the hand-off is copied "
++                                         "by the host\n", b, b + 1);
++                }
+             }
+             split_drive.base = &drive;
+             split_drive.n = n_stages;
+             for (int st = 0; st < n_stages; ++st) {
+                 stage_ver(st).set_stage(st == 0 ? 0 : split_at[(size_t) st - 1], st + 1 < n_stages ? split_at[(size_t) st] : -1,
+-                                        st == 0 ? nullptr : hand[(size_t) st - 1], st + 1 < n_stages ? hand[(size_t) st] : nullptr);
++                                        st == 0 ? nullptr : hand_in[(size_t) st - 1], st + 1 < n_stages ? hand[(size_t) st] : nullptr);
+                 split_drive.end[st] = st + 1 < n_stages ? split_at[(size_t) st] : g.n_layers;
+                 split_drive.cache_base[st] = drive.d.cache_base;
+                 split_drive.cache_slot_off[st] = drive.d.cache_slot_off;
+-- 
+2.53.0
+

@@ -1,0 +1,38 @@
+From 0191313790de51d743b04b111dfa8b9299d55e56 Mon Sep 17 00:00:00 2001
+From: AgentHub stack <noreply@example.invalid>
+Date: Mon, 19 Oct 2026 16:17:58 +0000
+Subject: [PATCH 03/17] four-gpu: cap NVPTX registers (1024-item work-groups)
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ sycl/CMakeLists.txt | 9 ++++++++-
+ 1 file changed, 8 insertions(+), 1 deletion(-)
+
+diff --git a/sycl/CMakeLists.txt b/sycl/CMakeLists.txt
+index a4b54ef..b517088 100644
+--- a/sycl/CMakeLists.txt
++++ b/sycl/CMakeLists.txt
+@@ -46,12 +46,19 @@ endif()
+ # engine drives Intel and NVIDIA cards together; STRATA_SYCL_CUDA_PATH names the CUDA toolkit for it.
+ set(STRATA_SYCL_NVPTX "" CACHE STRING "four-gpu: also build for NVIDIA, e.g. sm_75 (empty: Intel only)")
+ set(STRATA_SYCL_CUDA_PATH "" CACHE PATH "four-gpu: the CUDA toolkit for STRATA_SYCL_NVPTX")
++set(STRATA_SYCL_NVPTX_MAXRREG 64 CACHE STRING "four-gpu: ptxas register cap per thread (empty: none)")
+ if(STRATA_SYCL_AOT)
+   set(_sycl_targets spir64_gen)
+   set(_sycl_nv "")
+   if(STRATA_SYCL_NVPTX)
+     string(APPEND _sycl_targets ",nvptx64-nvidia-cuda")
+-    list(APPEND _sycl_nv -Xsycl-target-backend=nvptx64-nvidia-cuda --cuda-gpu-arch=${STRATA_SYCL_NVPTX} -Wno-unknown-cuda-version)
++    # SHELL: groups keep CMake from de-duplicating the repeated -Xsycl-target-backend
++    list(APPEND _sycl_nv "SHELL:-Xsycl-target-backend=nvptx64-nvidia-cuda --cuda-gpu-arch=${STRATA_SYCL_NVPTX}"
++         -Wno-unknown-cuda-version)
++    if(STRATA_SYCL_NVPTX_MAXRREG)   # 1024-item work-groups (no __launch_bounds__ after dpct) need <= 64 registers
++      list(APPEND _sycl_nv "SHELL:-Xsycl-target-backend=nvptx64-nvidia-cuda -Xcuda-ptxas"
++           "SHELL:-Xsycl-target-backend=nvptx64-nvidia-cuda --maxrregcount=${STRATA_SYCL_NVPTX_MAXRREG}")
++    endif()
+     if(STRATA_SYCL_CUDA_PATH)
+       list(APPEND _sycl_nv --cuda-path=${STRATA_SYCL_CUDA_PATH})
+     endif()
+-- 
+2.53.0
+

@@ -1,0 +1,37 @@
+From d02ce0ad3e474beb60808a17062d6a2455eed4a2 Mon Sep 17 00:00:00 2001
+From: AgentHub stack <noreply@example.invalid>
+Date: Mon, 19 Oct 2026 19:28:34 +0000
+Subject: [PATCH 13/17] four-gpu: the Monitor reads the NVIDIA cards of a mixed
+ split too (numbered after the Intel ones)
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ sycl/serve/server_intel.py | 9 ++++++++-
+ 1 file changed, 8 insertions(+), 1 deletion(-)
+
+diff --git a/sycl/serve/server_intel.py b/sycl/serve/server_intel.py
+index baae26c..fb74453 100644
+--- a/sycl/serve/server_intel.py
++++ b/sycl/serve/server_intel.py
+@@ -39,10 +39,17 @@ def install_xe_reader():
+     so the cards it reports are the Intel ones; before, an NVIDIA card in the same PC answered first and the Monitor
+     (and the benchmark report, which takes the card's name from it) showed the GeForce the engine never used."""
+     orig = T.gpu_reader
++    n_xe = 0                                    # the Intel cards, numbered as _XeGpu numbers them
++    while _XeGpu(n_xe).ok():
++        n_xe += 1
+ 
+     def gpu_reader(index=0, amd=False):
+         xe = _XeGpu(index)
+-        return xe if xe.ok() else orig(index, amd)
++        if xe.ok():
++            return xe
++        # four-gpu (docs/FOUR_GPU.md): a split across Intel and NVIDIA cards numbers the NVIDIA ones after the Intel
++        # ones, so index n_xe is NVML's card 0 - asked as `index` it named no card and the Monitor left them out
++        return orig(index - n_xe if 0 < n_xe <= index else index, amd)
+ 
+     T.gpu_reader = gpu_reader
+ 
+-- 
+2.53.0
+

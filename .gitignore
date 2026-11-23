@@ -1,0 +1,9 @@
+data/
+uploads/
+.venv/
+__pycache__/
+*.pyc
+config.local.toml
+*.log
+speech/cache/
+speech/refs/*.wav

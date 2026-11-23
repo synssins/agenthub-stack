@@ -1,0 +1,253 @@
+/* shell.css: the app chrome. Header, navigation sidebar, members panel, composer and footer.
+   Loaded after style.css and ui.css and overrides the older chrome rules there.
+   Colours and sizes come from the theme tokens in style.css only. */
+
+/* ---- Header ---- */
+header {
+    min-height: 48px;
+    padding: 0 var(--space-lg);
+    gap: var(--space-md);
+    border-bottom: 1px solid var(--border);
+    box-shadow: none;
+}
+.header-left { min-width: 0; gap: 10px; }
+header h1 { color: var(--text-strong); font-size: var(--fs-base); font-weight: var(--fw-semibold); white-space: nowrap; }
+.subtitle {
+    min-width: 0; padding-left: 10px; border-left: 1px solid var(--border-strong);
+    overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+    color: var(--text-dim); font-size: var(--fs-sm); font-weight: var(--fw-normal);
+}
+.subtitle:empty { display: none; }
+.header-right { min-width: 0; gap: var(--space-md); }
+
+/* ---- Tool buttons: Jobs, Rules, Pinned, Scheduled, Settings, Help ----
+   One set of buttons. In the sidebar they are rows with a label; in the header
+   (Top bar mode on a wide screen) the same buttons are an icon group. */
+.nav-tools { display: flex; flex-direction: column; gap: 1px; }
+.nav-item, .channel-sidebar-row {
+    display: flex; align-items: center; gap: 10px;
+    width: 100%; min-height: 32px; padding: 0 8px;
+    border: none; border-radius: var(--radius-md);
+    background: transparent; color: var(--text);
+    font: inherit; font-size: var(--fs-md); font-weight: var(--fw-medium); text-align: left;
+    cursor: pointer; position: relative;
+    transition: background var(--duration-fast), color var(--duration-fast);
+}
+.nav-item svg { flex: none; color: var(--text-dim); transition: color var(--duration-fast); }
+.nav-label { flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.nav-item:hover, .channel-sidebar-row:hover { background: var(--white-06); color: var(--text-strong); }
+.nav-item:hover svg { color: var(--text); }
+.nav-item:active, .channel-sidebar-row:active { background: var(--white-10); }
+.nav-item.active, .nav-item[aria-pressed="true"], .channel-sidebar-row.active {
+    background: var(--accent-soft); color: var(--text-strong);
+}
+.nav-item.active svg, .nav-item[aria-pressed="true"] svg { color: var(--accent); }
+.nav-item:disabled { opacity: 0.45; cursor: not-allowed; }
+:is(.nav-item, .channel-sidebar-row, .nav-group-toggle, .nav-icon-btn, .mobile-nav-btn, .channel-add):focus-visible {
+    outline: 2px solid var(--accent); outline-offset: -2px;
+}
+/* Scheduled messages: only while the strip above the composer has something to show */
+body:has(#schedules-bar.hidden) #schedules-toggle { display: none; }
+
+/* Count badges (ids are written by jobs.js and rules-panel.js) */
+.jobs-badge, .rules-badge, .channel-sidebar-row-unread {
+    position: static; flex: none;
+    min-width: 18px; height: 18px; padding: 0 5px;
+    border-radius: var(--radius-full);
+    background: var(--accent); color: var(--text-on-accent);
+    font-size: var(--fs-xs); font-weight: var(--fw-semibold); font-variant-numeric: tabular-nums; line-height: 1;
+}
+
+/* Header placement: icon only, label kept for screen readers */
+#header-tools { display: flex; align-items: center; gap: var(--space-sm); }
+#header-tools:empty { display: none; }
+#header-tools .nav-tools { flex-direction: row; gap: 2px; }
+#header-tools .nav-tools + .nav-tools { padding-left: var(--space-sm); border-left: 1px solid var(--border); }
+#header-tools .nav-item { width: 32px; height: 32px; padding: 0; justify-content: center; }
+#header-tools .nav-label {
+    position: absolute; width: 1px; height: 1px; overflow: hidden; clip-path: inset(50%); white-space: nowrap;
+}
+#header-tools :is(.jobs-badge, .rules-badge) {
+    position: absolute; top: -3px; right: -3px; min-width: 16px; height: 16px; padding: 0 4px;
+}
+
+/* ---- Navigation sidebar ---- */
+#channel-sidebar { background: var(--bg-header); overflow-y: auto; scrollbar-width: thin; }
+#channel-sidebar-top { padding: var(--space-sm) var(--space-sm) 0; }
+#channel-sidebar-top:not(:has(.update-pill:not(.hidden))) { display: none; }
+
+.nav-group { display: flex; flex-direction: column; flex: none; padding: var(--space-sm) var(--space-sm) 0; }
+.nav-group + .nav-group { margin-top: var(--space-sm); border-top: 1px solid var(--border); }
+.nav-group[data-group="channels"] { flex: 0 1 auto; min-height: 0; }
+.nav-group[data-group="channels"]:not(.collapsed) { min-height: 150px; }   /* the list scrolls inside; never squeezed away */
+.nav-group-head { display: flex; align-items: center; gap: 2px; min-height: 28px; flex: none; }
+.nav-group-toggle {
+    flex: 1; min-width: 0; display: flex; align-items: center; gap: 8px;
+    min-height: 28px; padding: 0 8px;
+    border: none; border-radius: var(--radius-md); background: transparent;
+    color: var(--text-dim); font: inherit; font-size: var(--fs-sm); font-weight: var(--fw-semibold); text-align: left;
+    cursor: pointer; user-select: none;
+    transition: background var(--duration-fast), color var(--duration-fast);
+}
+.nav-group-toggle::before {                    /* chevron: points down when open, right when collapsed */
+    content: ""; flex: none; width: 6px; height: 6px; margin: 0 3px 2px 1px;
+    border-right: 1.2px solid currentColor; border-bottom: 1.2px solid currentColor;
+    transform: rotate(45deg); transition: transform var(--duration-normal) var(--ui-ease);
+}
+.nav-group.collapsed .nav-group-toggle::before { transform: rotate(-45deg); margin-bottom: 0; }
+.nav-group-toggle:hover { background: var(--white-06); color: var(--text); }
+.nav-group-body { display: flex; flex-direction: column; gap: 1px; min-height: 0; padding-top: 2px; }
+.nav-group.collapsed .nav-group-body { display: none; }
+.nav-group-unread { min-height: 18px; padding: 0 6px; }
+.nav-group-unread.hidden, .nav-group:not(.collapsed) .nav-group-unread { display: none; }
+
+.nav-icon-btn, .channel-add {
+    display: inline-flex; align-items: center; justify-content: center; flex: none;
+    width: 28px; height: 28px; padding: 0;
+    border: none; border-radius: var(--radius-md); background: transparent; color: var(--text-dim);
+    cursor: pointer; opacity: 1;
+    transition: background var(--duration-fast), color var(--duration-fast);
+}
+.nav-icon-btn:hover, .channel-add:hover { background: var(--white-06); color: var(--text-strong); }
+.nav-icon-btn:active, .channel-add:active { background: var(--white-10); }
+
+.nav-filter {
+    flex: none; width: 100%; min-height: 28px; margin: 0 0 4px; padding: 0 8px;
+    border: 1px solid var(--border); border-radius: var(--radius-md);
+    background: var(--bg-input); color: var(--text);
+    font: inherit; font-size: var(--fs-sm);
+    transition: border-color var(--duration-fast);
+}
+.nav-filter::placeholder { color: var(--text-dim); opacity: 1; }
+.nav-filter:hover { border-color: var(--border-strong); }
+.nav-filter:focus-visible { outline: 2px solid var(--accent); outline-offset: -1px; border-color: var(--accent); }
+.nav-filter.hidden { display: none; }
+.nav-empty { padding: 6px 8px; color: var(--text-dim); font-size: var(--fs-sm); }
+
+#channel-sidebar-list { flex: 1 1 auto; min-height: 0; padding: 0; overflow-y: auto; scrollbar-width: thin; }
+.channel-sidebar-row { flex: none; }
+.channel-sidebar-row[hidden] { display: none; }
+.channel-sidebar-row.active { font-weight: var(--fw-semibold); }
+.channel-sidebar-row:has(.channel-sidebar-row-unread) { color: var(--text-strong); font-weight: var(--fw-semibold); }
+.channel-sidebar-row-actions { width: 0; overflow: hidden; }   /* no room taken from the name until needed */
+.channel-sidebar-row:is(:hover, :focus-within, .confirm-delete) .channel-sidebar-row-actions { width: auto; overflow: visible; opacity: 1; pointer-events: auto; }
+.channel-sidebar-row-actions button { display: inline-flex; align-items: center; justify-content: center; width: 22px; height: 22px; padding: 0; opacity: 1; }
+.channel-sidebar-row-actions button:hover { color: var(--text-strong); }
+.channel-sidebar-row-actions button:focus-visible { outline: 2px solid var(--accent); outline-offset: -1px; }
+.channel-sidebar-row.confirm-delete { background: var(--error-soft); color: var(--error-color); }
+#channel-sidebar-list .channel-inline-create { flex: none; padding: 3px 8px; }
+@media (hover: none) {
+    .channel-sidebar-row.active .channel-sidebar-row-actions { width: auto; overflow: visible; opacity: 1; pointer-events: auto; }
+}
+
+.nav-bottom { flex: none; margin-top: auto; padding-top: var(--space-sm); }
+.nav-bottom .nav-tools { padding: var(--space-sm); border-top: 1px solid var(--border); }
+.channel-sidebar-grip:hover, .channel-sidebar-grip.dragging { background: var(--border-strong); }
+
+/* ---- Channel bar (Top bar mode) ---- */
+#channel-bar { border-bottom: 1px solid var(--border); box-shadow: none; }
+
+/* ---- Members panel: same headings and rows as the navigation ---- */
+#members-panel { padding: var(--space-sm); scrollbar-width: thin; }
+.members-header {
+    display: flex; align-items: center; gap: 8px; min-height: 28px; padding: 0 8px;
+    color: var(--text-dim); font-size: var(--fs-sm); font-weight: var(--fw-semibold);
+    letter-spacing: 0; text-transform: none;
+}
+.members-header .ui-badge { min-height: 18px; padding: 0 6px; }
+.members-group {
+    padding: var(--space-md) 8px 4px;
+    color: var(--text-dim); font-size: var(--fs-xs); font-weight: var(--fw-medium);
+    letter-spacing: 0; text-transform: none;
+}
+.member { border-radius: var(--radius-md); transition: background var(--duration-fast); }
+.member:hover { background: var(--white-06); }
+.member-name { font-size: var(--fs-md); }
+.members-add { border-radius: var(--radius-md); }
+.members-add:hover, .members-add:focus-visible { border-color: var(--text-dim); }
+
+/* ---- Phone drawer buttons ---- */
+.mobile-nav-btn {
+    width: 36px; height: 36px; border: none; border-radius: var(--radius-md);
+    background: transparent; color: var(--text);
+    transition: background var(--duration-fast);
+}
+.mobile-nav-btn:hover { background: var(--white-06); }
+.mobile-nav-btn[aria-expanded="true"] { background: var(--accent-soft); color: var(--text-strong); }
+
+/* ---- Composer and footer ---- */
+footer { border-top: 1px solid var(--border); box-shadow: none; }
+
+/* One shape for the icon buttons of the composer row */
+#session-launch-btn, #mic, .voice-talk, .voice-auto {
+    width: 40px; height: 40px; min-height: 40px; padding: 0;
+    border: 1px solid var(--border); border-radius: var(--radius-lg);
+    transition: background var(--duration-fast), border-color var(--duration-fast), color var(--duration-fast);
+}
+#session-launch-btn:hover, #mic:not(.recording):hover, .voice-talk:hover, .voice-auto:not([aria-pressed="true"]):hover {
+    border-color: var(--border-strong); color: var(--text-strong);
+}
+:is(#session-launch-btn, #mic:not(.recording), .voice-talk:not([data-state]), .voice-talk[data-state="off"], .voice-auto):hover {
+    background: var(--white-06);
+}
+.effort-select { height: 40px; transition: border-color var(--duration-fast), color var(--duration-fast); }
+.effort-select:hover { border-color: var(--border-strong); }
+.effort-select:focus-visible { border-color: var(--accent); }
+#send { height: 40px; }
+.send-clock { width: 36px; padding: 0; }
+.send-clock:hover { background: color-mix(in srgb, var(--accent) 88%, var(--tint)); }
+:is(#session-launch-btn, #mic, .voice-talk, .voice-auto, .effort-select, #clear-chat-btn):focus-visible {
+    outline: 2px solid var(--accent); outline-offset: 1px;
+}
+:is(#send, .send-clock):focus-visible { outline: 2px solid var(--text-strong); outline-offset: -3px; }
+
+/* Clear chat: present, never loud until it asks for confirmation */
+#clear-chat-btn.ghost-btn:not(.confirming) {
+    min-height: 24px; padding: 0 8px;
+    border-color: transparent; background: transparent; color: var(--text-dim);
+    font-size: var(--fs-sm); font-weight: var(--fw-medium);
+}
+#clear-chat-btn.ghost-btn:not(.confirming):hover { background: var(--white-06); border-color: transparent; color: var(--text); }
+#clear-chat-btn.ghost-btn.confirming { min-height: 24px; padding: 0 8px; font-size: var(--fs-sm); }
+
+.input-hint { margin-top: 6px; color: var(--text-dim); font-size: var(--fs-xs); }
+
+/* ---- Help: closing block (composer keys and the About line) ---- */
+.hg-about {
+    position: fixed; left: 50%; bottom: 32px; z-index: 10002; transform: translateX(-50%);
+    width: max-content; max-width: min(760px, calc(100vw - 32px)); padding: 8px 14px;
+    border: 1px solid var(--border); border-radius: var(--radius-lg); background: var(--bg-header);
+    color: var(--text-dim); font-size: var(--fs-xs); line-height: var(--lh-relaxed); text-align: center;
+    pointer-events: auto;
+}
+.hg-about p { margin: 0; }
+.hg-about a { color: var(--text); text-decoration: underline; text-underline-offset: 2px; }
+.hg-about a:hover { color: var(--accent); }
+.hg-about a:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; border-radius: var(--radius-sm); }
+.hg-content .hg-about {
+    position: static; transform: none; width: auto; max-width: none; padding: 14px 16px;
+    border: none; border-radius: 0; background: transparent; text-align: left;
+}
+.hg-content .hg-about p + p { margin-top: 6px; }
+
+/* ---- Phones and tablets ---- */
+@media (max-width: 900px) {
+    header { padding: 0 var(--space-sm); }
+    header h1 { font-size: var(--fs-base); }
+    /* The navigation is a drawer in both channel-list modes, so every tool stays reachable */
+    #channel-sidebar.hidden { display: flex; }
+    .nav-item, .channel-sidebar-row { min-height: 40px; }
+    .nav-group-toggle, .nav-group-head { min-height: 36px; }
+    .nav-icon-btn { width: 36px; height: 36px; }
+    .nav-filter { min-height: 36px; font-size: 16px; }   /* 16px stops iOS zooming on focus */
+}
+
+@media (prefers-reduced-motion: reduce) {
+    .nav-item, .nav-item svg, .channel-sidebar-row, .nav-group-toggle, .nav-group-toggle::before, .nav-icon-btn, .channel-add,
+    .nav-filter, .member, .mobile-nav-btn, #session-launch-btn, #mic, .voice-talk, .voice-auto, .effort-select { transition: none; }
+}
+
+/* Discord servers in the channel list (discord_gateway.py) */
+.nav-group.discord-server[hidden] { display: none; }
+.nav-group.discord-server .nav-group-title { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.channel-sidebar-row.left .channel-sidebar-row-label { opacity: .55; font-style: italic; }

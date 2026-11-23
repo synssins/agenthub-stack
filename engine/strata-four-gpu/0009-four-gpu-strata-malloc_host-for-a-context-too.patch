@@ -1,0 +1,34 @@
+From ec8b87f3cbf951ca863394db76cbc8277e1047c5 Mon Sep 17 00:00:00 2001
+From: AgentHub stack <noreply@example.invalid>
+Date: Mon, 19 Oct 2026 17:58:25 +0000
+Subject: [PATCH 09/17] four-gpu: strata::malloc_host for a context too
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ sycl/include/strata/host_visible.hpp | 12 ++++++++++++
+ 1 file changed, 12 insertions(+)
+
+diff --git a/sycl/include/strata/host_visible.hpp b/sycl/include/strata/host_visible.hpp
+index e0331a2..ee54f56 100644
+--- a/sycl/include/strata/host_visible.hpp
++++ b/sycl/include/strata/host_visible.hpp
+@@ -59,4 +59,16 @@ inline T* malloc_host(size_t count, const sycl::queue& q) {
+     return p;
+ }
+ 
++template <typename T>
++inline T* malloc_host(size_t count, const sycl::context& c) {
++    T* p = sycl::malloc_host<T>(count, c);
++    make_host_visible(p, count * sizeof(T));
++    return p;
++}
++inline void* malloc_host(size_t bytes, const sycl::context& c) {
++    void* p = sycl::malloc_host(bytes, c);
++    make_host_visible(p, bytes);
++    return p;
++}
++
+ }  // namespace strata
+-- 
+2.53.0
+

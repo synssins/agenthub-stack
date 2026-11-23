@@ -1,0 +1,45 @@
+From 83711a5b301d17791c044af5d8c1134a6a30f236 Mon Sep 17 00:00:00 2001
+From: AgentHub stack <noreply@example.invalid>
+Date: Mon, 19 Oct 2026 20:07:08 +0000
+Subject: [PATCH 17/17] four-gpu: docs - async cuBLAS numbers
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ docs/FOUR_GPU.md | 7 +++----
+ 1 file changed, 3 insertions(+), 4 deletions(-)
+
+diff --git a/docs/FOUR_GPU.md b/docs/FOUR_GPU.md
+index 42b772b..1cd98f4 100644
+--- a/docs/FOUR_GPU.md
++++ b/docs/FOUR_GPU.md
+@@ -8,7 +8,7 @@ IQ3_S, branch `four-gpu` on top of 477ac13 (after v0.1.45).
+ |---|---:|---:|---:|
+ | experts in VRAM | 17.2k of 24.6k (~99.0% routed) | 16.0k (~98.8%) | **23.2k (~99.8%)** |
+ | decode, 300-token chats (median of 3) | 30-37 tok/s | 30.8 | **21.1** (21-27) |
+-| prompt, 3K tokens | 554-653 | 552 | **113** |
++| prompt, 3K tokens | 554-653 | 552 | **113** (host_task cuBLAS); **412** on a fresh 22.5K prompt with the async cuBLAS (80f9200) |
+ | images | yes (CPU encoder) | yes | yes |
+ 
+ **Today the four-card engine is slower than the two B60s alone.** It holds more of the model in VRAM, but the T4
+@@ -33,7 +33,7 @@ registers, and each Intel/NVIDIA boundary is a host copy. See "Not done" for wha
+ |---|---|
+ | `STRATA_SYCL_NVPTX_MAXRREG` (default 64), passed as top-level `-Xcuda-ptxas --maxrregcount` (0191313, 589b971) | many kernels launch 1024-item work-groups and dpct dropped CUDA's `__launch_bounds__`; one used 232 registers x 1024 > 65536 (`UR_RESULT_ERROR_OUT_OF_RESOURCES`). Through `-Xsycl-target-backend` the option does not reach ptxas |
+ | `use_root_sync` removed from all 394 launches, 49 files (5b09089) | dpct added it as boilerplate; no kernel syncs the grid. On CUDA it makes every launch cooperative, which fails past one wave (`CUDA_ERROR_COOPERATIVE_LAUNCH_TOO_LARGE`) |
+-| `strata/prefill/gemm_ex.hpp` (new), the 3 prompt GEMMs in `gemm.dp.cpp` call it (ef33cc9, e7dfce2) | `dpct::blas::gemm` is oneMKL, Intel GPUs only (a 3K prompt segfaulted). On a CUDA queue `gemm_ex` calls `cublasGemmEx` on the queue's stream from a `host_task` (then `cuStreamSynchronize`); elsewhere unchanged. Links cuBLAS and the driver stub when `STRATA_SYCL_NVPTX` is set |
++| `strata/prefill/gemm_ex.hpp` (new), the 3 prompt GEMMs in `gemm.dp.cpp` call it (ef33cc9, e7dfce2, 80f9200) | `dpct::blas::gemm` is oneMKL, Intel GPUs only (a 3K prompt segfaulted). On a CUDA queue `gemm_ex` enqueues `cublasGemmEx` on the queue's own stream with `ext_codeplay_enqueue_native_command`; elsewhere unchanged. Links cuBLAS and the driver stub when `STRATA_SYCL_NVPTX` is set. The first form (a `host_task` + `cuStreamSynchronize` per GEMM) spent 92% of a T4 stage's prompt time on the host (47.8 s per 4096-token chunk); enqueued, 5-8 s |
+ 
+ ### 3. The layer split crosses vendors
+ 
+@@ -102,8 +102,7 @@ boundaries, each a host copy.
+ 
+ ## Not done / known issues
+ 
+-- **Speed.** Per-kernel `__launch_bounds__` equivalents instead of the global 64-register cap; an async cuBLAS call
+-  (`ext_codeplay_enqueue_native_command`) instead of `host_task` + stream sync; a card order with one vendor
++- **Speed.** Per-kernel `__launch_bounds__` equivalents instead of the global 64-register cap; a card order with one vendor
+   boundary instead of two (T4, T4, B60, B60); tensor-core prompt kernels for NVIDIA in place of the stubbed XMX ones.
+   The prompt path (113 tok/s) is where the T4 stages hurt most.
+ - `--pipeline-windows` (its second hand-off, `hand_b`) and `--parallel` / `--batch` slots on a mixed split: not run.
+-- 
+2.53.0
+

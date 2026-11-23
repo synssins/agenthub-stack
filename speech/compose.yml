@@ -1,0 +1,22 @@
+# Chatterbox Turbo streaming server: OpenAI /v1/audio/speech on 4125, Wyoming TTS on 10220.
+# Needs an NVIDIA GPU with about 6 GB free and the NVIDIA container runtime. No login: keep it on a trusted LAN.
+services:
+  speech:
+    build: .
+    image: agenthub-speech:0.1
+    container_name: agenthub-speech
+    restart: unless-stopped
+    ports:
+      - "4125:4125"
+      - "10220:10220"
+    volumes:
+      - ./voices:/voices        # saved voice presets (.pt)
+      - ./refs:/refs:ro         # reference recordings (.wav): a preset is made from one on first use
+      - ./cache:/cache          # the model, downloaded from Hugging Face on first start (about 4 GB)
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: 1          # or device_ids: ["0"] to pin one GPU
+              capabilities: [gpu]

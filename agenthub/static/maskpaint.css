@@ -1,0 +1,101 @@
+/* Mask painting in the image lightbox (static/maskpaint.js). Colours come from theme tokens. */
+
+.maskpaint-btn {
+    display: inline-flex;
+    align-items: center;
+    gap: 6px;
+    height: 34px;
+    padding: 0 12px;
+    border: 1px solid var(--border);
+    border-radius: var(--radius-md);
+    background: var(--bg-elevated);
+    color: var(--text);
+    font: inherit;
+    font-size: 13px;
+    font-weight: 500;
+    cursor: pointer;
+    white-space: nowrap;
+    transition: background 0.15s, border-color 0.15s;
+}
+.maskpaint-btn:hover { background: var(--bg-msg-hover); border-color: var(--border-strong); }
+.maskpaint-btn[aria-pressed="true"] { background: var(--accent-soft); border-color: var(--accent); color: var(--text-strong); }
+.maskpaint-use { background: var(--accent); border-color: var(--accent); color: var(--text-on-accent); }
+.maskpaint-use:hover { background: var(--accent); border-color: var(--accent); filter: brightness(1.08); }
+
+.maskpaint-open {
+    position: absolute;
+    top: 16px;
+    right: 16px;
+}
+
+.maskpaint-canvas,
+.maskpaint-ring,
+.maskpaint-bar { display: none; }
+
+#image-modal.maskpainting { cursor: default; }
+#image-modal.maskpainting img { max-height: calc(100vh - 160px); transform: translateY(-24px); }
+#image-modal.maskpainting :is(.modal-nav, .modal-counter, .maskpaint-open) { display: none !important; }
+
+#image-modal.maskpainting .maskpaint-canvas {
+    display: block;
+    position: fixed;
+    opacity: 0.5;
+    cursor: crosshair;
+    touch-action: none;
+    border-radius: var(--radius-lg);
+}
+
+.maskpaint-ring {
+    position: fixed;
+    border: 1.5px solid var(--text-strong);
+    box-shadow: 0 0 0 1px rgba(var(--shadow-rgb), 0.6);
+    border-radius: var(--radius-full);
+    transform: translate(-50%, -50%);
+    pointer-events: none;
+    z-index: 1;
+}
+
+#image-modal.maskpainting .maskpaint-bar {
+    position: absolute;
+    bottom: 16px;
+    left: 50%;
+    transform: translateX(-50%);
+    display: flex;
+    flex-wrap: wrap;
+    align-items: center;
+    justify-content: center;
+    gap: 6px;
+    width: max-content;
+    max-width: calc(100vw - 32px);
+    padding: 8px;
+    border: 1px solid var(--border);
+    border-radius: var(--radius-lg);
+    background: var(--bg-header);
+    box-shadow: 0 4px 24px rgba(var(--shadow-rgb), 0.5);
+    cursor: default;
+}
+
+.maskpaint-size {
+    display: inline-flex;
+    align-items: center;
+    gap: 8px;
+    padding: 0 6px;
+    color: var(--text-dim);
+    font-size: 13px;
+}
+.maskpaint-size input { width: 110px; accent-color: var(--accent); }
+
+.maskpaint-status:empty { display: none; }
+.maskpaint-status {
+    flex-basis: 100%;
+    text-align: center;
+    color: var(--text-dim);
+    font-size: 12px;
+}
+
+@media (max-width: 600px) {
+    #image-modal.maskpainting img { max-width: calc(100vw - 32px); max-height: calc(100vh - 220px); }
+    .maskpaint-bar .maskpaint-btn:not(.maskpaint-use) span { display: none; }
+    .maskpaint-bar .maskpaint-btn { padding: 0 10px; height: 40px; }
+    .maskpaint-size input { width: 96px; }
+}
